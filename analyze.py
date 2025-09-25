@@ -1,125 +1,113 @@
-# analyze.py
-import requests
-import sys, json
+# analyze.py (витяг ключових частин)
+import os, time, json, math, requests
 import pandas as pd
 from datetime import datetime, timezone
-import time
 
+MIRRORS = [
+    # офіційне публічне дзеркало Binance для public endpoints
+    "https://data-api.binance.vision",
+    # основний futures API (як fallback)
+    "https://fapi.binance.com",
+]
 
-SYMBOLS = ["BTCUSDT", "BTCUSDC"]
-INTERVALS = ["15m", "1h", "4h", "1d"]  # «яструбині» ТФ
-LIMIT = 200  # достатньо для EMA200/MACD
-BASE_URL = "https://fapi.binance.com/fapi/v1/klines"
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "topvlad-btc-futures/1.0 (+github actions)",
+    "Accept": "application/json",
+})
 
-def fetch_klines(symbol, interval, limit=LIMIT):
-    try:
-        r = requests.get(BASE_URL, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=20)
-        if r.status_code == 451:
-            raise RuntimeError("HTTP 451 from Binance (CI IP blocked)")
-        r.raise_for_status()
-        data = r.json()
-        closes = [float(c[4]) for c in data]
-        ts_close = int(data[-1][6]) if data else None
-        return closes, ts_close
-    except Exception as e:
-        # пробросимо далі — обробимо у main()
-        raise
-
-def fetch_with_retry(url, params, tries=3, pause=1.5):
-    for i in range(tries):
-        r = requests.get(url, params=params, timeout=20)
-        if r.status_code == 200:
-            return r.json()
-        if i < tries-1:
-            time.sleep(pause)
-    r.raise_for_status()
+def fetch_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    last_err = None
+    for base in MIRRORS:
+        url = f"{base}/fapi/v1/klines"
+        for attempt in range(5):
+            try:
+                r = SESSION.get(url, params=params, timeout=15)
+                # 451/403/429 -> пробуємо інше дзеркало або ретраї
+                if r.status_code in (451, 403, 429, 520, 525, 526):
+                    time.sleep(2**attempt)
+                    continue
+                r.raise_for_status()
+                raw = r.json()
+                # формат: [openTime, open, high, low, close, volume, closeTime, ...]
+                df = pd.DataFrame(raw, columns=[
+                    "openTime","open","high","low","close","volume",
+                    "closeTime","qav","numTrades","takerBase","takerQuote","ignore"
+                ])
+                df["close"] = pd.to_numeric(df["close"], errors="coerce")
+                df["ts"] = pd.to_datetime(df["closeTime"], unit="ms", utc=True)
+                return df[["ts","close"]].dropna().reset_index(drop=True)
+            except Exception as e:
+                last_err = e
+                time.sleep(1.5 * (attempt+1))
+        # наступне дзеркало
+    raise RuntimeError(f"fetch_failed_after_retries: {last_err}")
 
 def ema(series, n):
-    return pd.Series(series).ewm(span=n, adjust=False).mean().iloc[-1]
+    return series.ewm(span=n, adjust=False).mean()
 
 def rsi(series, n=14):
-    s = pd.Series(series)
-    delta = s.diff()
+    delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-    # Wilder smoothing
-    avg_gain = gain.ewm(alpha=1/n, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/n, adjust=False).mean()
-    rs = avg_gain.iloc[-1] / avg_loss.iloc[-1] if avg_loss.iloc[-1] != 0 else float("inf")
+    rs = gain.rolling(n).mean() / loss.rolling(n).mean()
     return 100 - (100 / (1 + rs))
 
-def macd(series, f=12, s=26, sig=9):
-    s = pd.Series(series)
-    ema_f = s.ewm(span=f, adjust=False).mean()
-    ema_s = s.ewm(span=s, adjust=False).mean()
-    macd_line = ema_f - ema_s
-    signal = macd_line.ewm(span=sig, adjust=False).mean()
-    hist = macd_line - signal
-    return macd_line.iloc[-1], signal.iloc[-1], hist.iloc[-1]
+def macd(series, fast=12, slow=26, signal=9):
+    ema_fast, ema_slow = ema(series, fast), ema(series, slow)
+    line = ema_fast - ema_slow
+    signal_line = line.ewm(span=signal, adjust=False).mean()
+    hist = line - signal_line
+    return line, signal_line, hist
 
-def basic_signal(close, e20, e50, e200, rsi14, macd_line, signal_line, hist):
-    notes = []
-    trend = "neutral"
-
-    # Trend via EMA200
-    if close > e200 and e50 > e200:
-        trend = "bullish"
-    elif close < e200 and e50 < e200:
-        trend = "bearish"
-
-    # Momentum via EMA20/50
-    if e20 > e50: notes.append("EMA20>EMA50 (up-momentum)")
-    if e20 < e50: notes.append("EMA20<EMA50 (down-momentum)")
-
-    # RSI zones
-    if rsi14 >= 70: notes.append("RSI overbought")
-    elif rsi14 <= 30: notes.append("RSI oversold")
-    else: notes.append("RSI neutral")
-
-    # MACD cross
-    if macd_line > signal_line: notes.append("MACD>Signal")
-    else: notes.append("MACD<Signal")
-
-    # Histogram sign
-    if hist > 0: notes.append("Hist +")
-    else: notes.append("Hist -")
-
-    return trend, ", ".join(notes)
+def compute_block(symbol, interval):
+    df = fetch_klines(symbol, interval, limit=200)
+    close = df["close"]
+    out = {
+        "symbol": symbol, "tf": interval,
+        "last_ts": df["ts"].iloc[-1].isoformat(),
+        "last_close": float(close.iloc[-1]),
+    }
+    for n in (20, 50, 200):
+        out[f"ema{n}"] = float(ema(close, n).iloc[-1])
+    out["rsi14"] = float(rsi(close, 14).iloc[-1])
+    m_line, m_sig, m_hist = macd(close)
+    out["macd"] = float(m_line.iloc[-1])
+    out["macd_signal"] = float(m_sig.iloc[-1])
+    out["macd_hist"] = float(m_hist.iloc[-1])
+    # прості сигнали
+    out["price_vs_ema200"] = "above" if out["last_close"] > out["ema200"] else "below"
+    out["ema20_cross_50"] = "bull" if out["ema20"] > out["ema50"] else "bear"
+    out["macd_cross"] = "bull" if out["macd"] > out["macd_signal"] else "bear"
+    return out
 
 def main():
-    rows = []
-    now_iso = datetime.now(timezone.utc).isoformat()
+    symbols = ["BTCUSDT", "BTCUSDC"]
+    tfs = ["15m","1h","4h","1d"]
+    blocks = []
+    stale = False
     try:
-        for sym in SYMBOLS:
-            for tf in INTERVALS:
-                closes, ts = fetch_klines(sym, tf)
-                close = closes[-1]
-                e20, e50, e200 = ema(closes,20), ema(closes,50), ema(closes,200)
-                r = rsi(closes)
-                m, sig, h = macd(closes)
-                trend, notes = basic_signal(close, e20, e50, e200, r, m, sig, h)
-                rows.append({
-                    "timestamp_utc": now_iso, "symbol": sym, "tf": tf,
-                    "close": round(close, 2),
-                    "ema20": round(e20, 2), "ema50": round(e50, 2), "ema200": round(e200, 2),
-                    "rsi14": round(r, 2), "macd": round(m,5), "signal": round(sig,5), "hist": round(h,5),
-                    "trend": trend, "notes": notes, "exchange_close_time_ms": ts
-                })
-        df = pd.DataFrame(rows)
-        df.to_csv("report.csv", index=False)
-        df.to_json("report.json", orient="records")
-        print("\n=== SUMMARY (last run) ===")
-        print(df.to_string(index=False))
+        for s in symbols:
+            for tf in tfs:
+                blocks.append(compute_block(s, tf))
     except Exception as e:
-        # створимо статус-файли, щоб Pages все одно деплоївся
-        status = {"error": "fetch_failed", "message": str(e), "hint": "Likely HTTP 451 from Binance on CI runner"}
-        with open("report.json", "w") as f:
-            json.dump(status, f, ensure_ascii=False, indent=2)
-        with open("report.csv", "w") as f:
-            f.write("error,message\nfetch_failed,\"{}\"\n".format(str(e).replace('"','\"')))
-        print("WARN:", status)
-        # ВАЖЛИВО: завершуємося кодом 0, щоб деплой Pages не відмінився
-        sys.exit(0)
+        # не валимо білд — маркуємо як stale
+        stale = True
+        blocks.append({"error": "fetch_failed", "message": str(e)})
+
+    report = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "stale": stale,
+        "data": blocks,
+    }
+    os.makedirs("public", exist_ok=True)
+    with open("public/report.json","w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    # простий HTML-індекс
+    with open("public/index.html","w", encoding="utf-8") as f:
+        f.write("""<h1>BTC Futures Reports</h1>
+<p><a href="report.json">report.json</a></p>""")
 
 if __name__ == "__main__":
     main()
