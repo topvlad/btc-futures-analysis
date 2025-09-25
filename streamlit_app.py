@@ -7,7 +7,7 @@ st.title("BTC Futures — EMA/RSI/MACD (15m, 1h, 4h, 1d)")
 
 pages_url = st.text_input(
     "GitHub Pages JSON URL:",
-    value="https://<логін>.github.io/btc-futures-analysis/report.json"
+    value="https://topvlad.github.io/btc-futures-analysis/report.json"
 )
 
 @st.cache_data(ttl=300)
