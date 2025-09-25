@@ -1,9 +1,19 @@
-import streamlit as st
 import pandas as pd
-import requests
+import json, requests, streamlit as st
+URL = "https://topvlad.github.io/btc-futures-analysis/report.json"
 
-st.set_page_config(page_title="BTC Futures MTF Dashboard", layout="wide")
 st.title("BTC Futures — EMA/RSI/MACD (15m, 1h, 4h, 1d)")
+st.write("GitHub Pages JSON URL:", URL)
+
+try:
+    r = requests.get(URL, timeout=15)
+    r.raise_for_status()
+    data = json.loads(r.content.decode("utf-8"))  # ← декодуємо байти як utf-8
+    if data.get("stale"):
+        st.warning("Дані позначені як STALE (mirror/мережа). Показуємо, що є.")
+    # ...рендерінг таблиць та сигналів...
+except Exception as e:
+    st.error(f"Failed to load JSON: {e}")
 
 pages_url = st.text_input(
     "GitHub Pages JSON URL:",
