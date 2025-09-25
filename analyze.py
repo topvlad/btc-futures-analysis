@@ -9,9 +9,6 @@ import time
 SYMBOLS = ["BTCUSDT", "BTCUSDC"]
 INTERVALS = ["15m", "1h", "4h", "1d"]  # «яструбині» ТФ
 LIMIT = 200  # достатньо для EMA200/MACD
-HEADERS = {"User-Agent": "topvlad-btc-futures-analysis/1.0 (+github actions)"}
-requests.get(url, params=params, headers=HEADERS, timeout=20)
-
 BASE_URL = "https://fapi.binance.com/fapi/v1/klines"
 
 def fetch_klines(symbol, interval, limit=LIMIT):
