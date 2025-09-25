@@ -1,49 +1,33 @@
+# .github/workflows/run.yml
 name: Binance Long-Term Analysis (Pages)
 
 on:
-  schedule:
-    - cron: "0 */3 * * *"   # щогодини -> */1 ; зараз раз на 3 години
   workflow_dispatch:
-
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
-concurrency:
-  group: "pages"
-  cancel-in-progress: true
+  schedule:
+    - cron: "7 * * * *"  # щогодини +7 хвилин
 
 jobs:
   build:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: pip install -r requirements.txt
+        with: { python-version: '3.11' }
+      - run: python -m pip install --upgrade pip
+      - run: pip install requests pandas
       - run: python analyze.py
-      # Збираємо артефакт для Pages
-      - name: Prepare Pages artifact
-        run: |
-          mkdir -p public
-          cp report.json public/
-          cp report.csv public/
-          # опціонально додати README.html або index.html
-          echo '<h1>BTC Futures Reports</h1><p><a href="report.json">report.json</a> | <a href="report.csv">report.csv</a></p>' > public/index.html
-      - name: Upload artifact to Pages
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: public
+      - uses: actions/upload-pages-artifact@v3
+        with: { path: ./public }
 
   deploy:
     needs: build
-    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
     steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
+      - id: deployment
         uses: actions/deploy-pages@v4
