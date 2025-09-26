@@ -2,47 +2,70 @@
 import os, time, json, math, requests
 import pandas as pd
 from datetime import datetime, timezone
+# analyze.py (витяг із верхньої частини файлу)
 
-MIRRORS = [
-    # офіційне публічне дзеркало Binance для public endpoints
-    "https://data-api.binance.vision",
-    # основний futures API (як fallback)
-    "https://fapi.binance.com",
+import os, time, json, math, requests
+from statistics import mean
+
+# ✅ Правильні бази для USDⓈ-M Futures
+FAPI_BASES = [
+    "https://fapi.binance.com",      # основний
+    "https://fapi1.binance.com",     # резерви (деякі регіони)
+    "https://fapi2.binance.com",
+    "https://fapi3.binance.com",
+    "https://fapi4.binance.com",
 ]
+
+# Якщо хочеш збирати безперервний контракт (перпетуал) замість символа:
+USE_CONTINUOUS = False  # або True
+PAIR = "BTCUSDT"
+CONTRACT_TYPE = "PERPETUAL"
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "topvlad-btc-futures/1.0 (+github actions)",
-    "Accept": "application/json",
+    "User-Agent": "btc-futures-analysis/1.0 (+github actions)"
 })
+TIMEOUT = 10
+RETRIES = 4
+BACKOFF = 1.6
 
-def fetch_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    last_err = None
-    for base in MIRRORS:
-        url = f"{base}/fapi/v1/klines"
-        for attempt in range(5):
+def _get(url, params):
+    last_exc = None
+    for base in FAPI_BASES:
+        full = base + url
+        for i in range(RETRIES):
             try:
-                r = SESSION.get(url, params=params, timeout=15)
-                # 451/403/429 -> пробуємо інше дзеркало або ретраї
-                if r.status_code in (451, 403, 429, 520, 525, 526):
-                    time.sleep(2**attempt)
-                    continue
+                r = SESSION.get(full, params=params, timeout=TIMEOUT)
+                if r.status_code == 451:
+                    # інколи зустрічається на окремих хостах — пробуємо інший
+                    break
                 r.raise_for_status()
-                raw = r.json()
-                # формат: [openTime, open, high, low, close, volume, closeTime, ...]
-                df = pd.DataFrame(raw, columns=[
-                    "openTime","open","high","low","close","volume",
-                    "closeTime","qav","numTrades","takerBase","takerQuote","ignore"
-                ])
-                df["close"] = pd.to_numeric(df["close"], errors="coerce")
-                df["ts"] = pd.to_datetime(df["closeTime"], unit="ms", utc=True)
-                return df[["ts","close"]].dropna().reset_index(drop=True)
-            except Exception as e:
-                last_err = e
-                time.sleep(1.5 * (attempt+1))
-        # наступне дзеркало
-    raise RuntimeError(f"fetch_failed_after_retries: {last_err}")
+                return r.json()
+            except requests.RequestException as e:
+                last_exc = e
+                time.sleep(BACKOFF**i)
+        # пробуємо наступний base
+    raise last_exc
+
+def fetch_klines(symbol: str, interval: str, limit: int = 200):
+    if USE_CONTINUOUS:
+        # ✅ Continuous Klines (перпетуал індекс по парі)
+        # /fapi/v1/continuousKlines?pair=BTCUSDT&contractType=PERPETUAL&interval=15m&limit=200
+        data = _get(
+            "/fapi/v1/continuousKlines",
+            {"pair": PAIR, "contractType": CONTRACT_TYPE, "interval": interval, "limit": limit}
+        )
+    else:
+        # ✅ Звичайні USDⓈ-M Futures Klines
+        # /fapi/v1/klines?symbol=BTCUSDT&interval=15m&limit=200
+        data = _get(
+            "/fapi/v1/klines",
+            {"symbol": symbol, "interval": interval, "limit": limit}
+        )
+    closes = [float(x[4]) for x in data]
+    ts = [int(x[6]) for x in data]   # closeTime мс
+    return closes, ts
+
 
 def ema(series, n):
     return series.ewm(span=n, adjust=False).mean()
