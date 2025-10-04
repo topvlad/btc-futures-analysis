@@ -3,14 +3,16 @@ import os, time, json, requests
 import pandas as pd
 from datetime import datetime, timezone
 
+CF_WORKER_BASE = (os.getenv("CF_WORKER_BASE") or "").strip()
+# Optional Cloudflare Worker base URL injected ahead of Binance hosts via CF_WORKER_BASE.
+
 FAPI_BASES = [
+    *([CF_WORKER_BASE] if CF_WORKER_BASE else []),
     "https://fapi.binance.com",
     "https://fapi1.binance.com",
     "https://fapi2.binance.com",
     "https://fapi3.binance.com",
     "https://fapi4.binance.com",
-    # опційно: свій CF-Worker першим у списку
-    # "https://<your-subdomain>.workers.dev",
 ]
 
 USE_CONTINUOUS = False  # True -> /continuousKlines за PAIR/CONTRACT_TYPE
