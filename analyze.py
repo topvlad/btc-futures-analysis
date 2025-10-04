@@ -65,26 +65,55 @@ def _get(url, params):
                 time.sleep(BACKOFF**i)
     raise RuntimeError(f"_get_failed_after_retries: {last_exc}")
 
-def fetch_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+def fetch_klines(symbol: str, interval: str, limit: int = 200) -> tuple[pd.DataFrame, str]:
     params = {"interval": interval, "limit": limit}
+
+    def _validate(data, route_label):
+        if not isinstance(data, list) or not data or not isinstance(data[0], list):
+            raise ValueError(f"Unexpected klines payload shape from {route_label}")
+
+        df_local = pd.DataFrame(data, columns=[
+            "openTime","open","high","low","close","volume",
+            "closeTime","qav","numTrades","takerBase","takerQuote","ignore"
+        ])
+        df_local["close"] = pd.to_numeric(df_local["close"], errors="coerce")
+        df_local["ts"]    = pd.to_datetime(df_local["closeTime"], unit="ms", utc=True)
+        df_local = df_local[["ts","close"]].dropna().reset_index(drop=True)
+        if df_local.empty:
+            raise ValueError(f"Empty klines dataframe from {route_label}")
+        return df_local
+
+    def _fetch(route, route_label, route_params):
+        data = _get(route, {**params, **route_params})
+        return _validate(data, route_label)
+
     if USE_CONTINUOUS:
-        data = _get("/fapi/v1/continuousKlines", {**params, "pair": PAIR, "contractType": CONTRACT_TYPE})
-    else:
-        data = _get("/fapi/v1/klines", {**params, "symbol": symbol})
+        df = _fetch(
+            "/fapi/v1/continuousKlines",
+            "continuousKlines (forced)",
+            {"pair": PAIR, "contractType": CONTRACT_TYPE},
+        )
+        return df, "continuousKlines (forced)"
 
-    if not isinstance(data, list) or not data or not isinstance(data[0], list):
-        raise ValueError("Unexpected klines payload shape")
-
-    df = pd.DataFrame(data, columns=[
-        "openTime","open","high","low","close","volume",
-        "closeTime","qav","numTrades","takerBase","takerQuote","ignore"
-    ])
-    df["close"] = pd.to_numeric(df["close"], errors="coerce")
-    df["ts"]    = pd.to_datetime(df["closeTime"], unit="ms", utc=True)
-    df = df[["ts","close"]].dropna().reset_index(drop=True)
-    if df.empty:
-        raise ValueError("Empty klines dataframe")
-    return df
+    try:
+        df = _fetch(
+            "/fapi/v1/klines",
+            "klines",
+            {"symbol": symbol},
+        )
+        return df, "klines"
+    except Exception as primary_exc:
+        try:
+            df = _fetch(
+                "/fapi/v1/continuousKlines",
+                "continuousKlines (fallback)",
+                {"pair": PAIR, "contractType": CONTRACT_TYPE},
+            )
+            return df, "continuousKlines (fallback)"
+        except Exception as fallback_exc:
+            raise RuntimeError(
+                f"klines failed: {primary_exc}; continuousKlines fallback failed: {fallback_exc}"
+            ) from fallback_exc
 
 def ema(s, n):   return s.ewm(span=n, adjust=False).mean()
 def rsi(s, n=14):
@@ -97,12 +126,13 @@ def macd(s, fast=12, slow=26, signal=9):
     return line, sig, line - sig
 
 def compute_block(symbol, interval):
-    df = fetch_klines(symbol, interval, limit=200)
+    df, route = fetch_klines(symbol, interval, limit=200)
     close = df["close"]
     out = {
         "symbol": symbol, "tf": interval,
         "last_ts": df["ts"].iloc[-1].isoformat(),
         "last_close": float(close.iloc[-1]),
+        "route": route,
     }
     for n in (20, 50, 200):
         out[f"ema{n}"] = float(ema(close, n).iloc[-1])
@@ -126,7 +156,10 @@ def main():
             print(f"[analyze] fetching {s} {tf} ...", flush=True)
             try:
                 b = compute_block(s, tf)
-                print(f"[analyze] ok {s} {tf} last_close={b['last_close']}", flush=True)
+                print(
+                    f"[analyze] ok {s} {tf} via {b['route']} last_close={b['last_close']}",
+                    flush=True,
+                )
                 blocks.append(b)
             except Exception as e:
                 stale = True
