@@ -15,9 +15,7 @@ FAPI_BASES = [
     "https://fapi4.binance.com",
 ]
 
-USE_CONTINUOUS = False  # True -> /continuousKlines за PAIR/CONTRACT_TYPE
-PAIR = "BTCUSDT"
-CONTRACT_TYPE = "PERPETUAL"
+USE_CONTINUOUS = False  # True -> always use /continuousKlines for derived pair/contractType
 
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -65,6 +63,37 @@ def _get(url, params):
                 time.sleep(BACKOFF**i)
     raise RuntimeError(f"_get_failed_after_retries: {last_exc}")
 
+def _continuous_params_for_symbol(symbol: str) -> tuple[str, str]:
+    """Return the (pair, contractType) tuple for the given futures symbol."""
+    if not symbol:
+        raise ValueError("Symbol required for continuous klines lookup")
+
+    overrides: dict[str, tuple[str, str]] = {
+        # Explicit overrides for symbols where heuristics may not be sufficient.
+        "BTCUSDT": ("BTCUSDT", "PERPETUAL"),
+        "BTCUSDC": ("BTCUSDC", "PERPETUAL"),
+    }
+    upper_symbol = symbol.upper()
+    if upper_symbol in overrides:
+        return overrides[upper_symbol]
+
+    if "_" in upper_symbol:
+        base, suffix = upper_symbol.split("_", 1)
+        suffix = suffix.strip()
+        if not base:
+            raise ValueError(f"Unable to derive continuous pair from symbol '{symbol}'")
+        contract_type = {
+            "PERP": "PERPETUAL",
+            "PERPETUAL": "PERPETUAL",
+        }.get(suffix, suffix)
+        if not contract_type:
+            raise ValueError(f"Unable to derive contract type from symbol '{symbol}'")
+        return base, contract_type
+
+    # Default assumption for USDⓈ-M perpetual symbols (e.g. BTCUSDT, ETHUSDT, BTCUSDC, ...)
+    return upper_symbol, "PERPETUAL"
+
+
 def fetch_klines(symbol: str, interval: str, limit: int = 200) -> tuple[pd.DataFrame, str]:
     params = {"interval": interval, "limit": limit}
 
@@ -87,11 +116,13 @@ def fetch_klines(symbol: str, interval: str, limit: int = 200) -> tuple[pd.DataF
         data = _get(route, {**params, **route_params})
         return _validate(data, route_label)
 
+    pair, contract_type = _continuous_params_for_symbol(symbol)
+
     if USE_CONTINUOUS:
         df = _fetch(
             "/fapi/v1/continuousKlines",
             "continuousKlines (forced)",
-            {"pair": PAIR, "contractType": CONTRACT_TYPE},
+            {"pair": pair, "contractType": contract_type},
         )
         return df, "continuousKlines (forced)"
 
@@ -107,7 +138,7 @@ def fetch_klines(symbol: str, interval: str, limit: int = 200) -> tuple[pd.DataF
             df = _fetch(
                 "/fapi/v1/continuousKlines",
                 "continuousKlines (fallback)",
-                {"pair": PAIR, "contractType": CONTRACT_TYPE},
+                {"pair": pair, "contractType": contract_type},
             )
             return df, "continuousKlines (fallback)"
         except Exception as fallback_exc:
