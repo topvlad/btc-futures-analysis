@@ -1,4 +1,4 @@
-# analyze.py (v1.52) — fix order, monthly Vision, multi-source live tail
+# analyze.py (v1.70) — spot-first, closed-candle only, fast run
 import os, time, json, io, csv, zipfile, math
 import requests
 import pandas as pd
@@ -19,9 +19,10 @@ FAPI_BASES = [
     "https://fapi5.binance.com",
 ]
 
+API_PRIMARY = "https://api.binance.com"
 SPOT_BASES = [
     *([CF_WORKER_BASE] if CF_WORKER_BASE else []),
-    "https://api.binance.com",
+    API_PRIMARY,
     "https://api1.binance.com",
     "https://api2.binance.com",
     "https://api3.binance.com",
@@ -31,7 +32,7 @@ SPOT_BASES = [
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "btc-futures-analysis/1.52 (+github actions)",
+    "User-Agent": "btc-futures-analysis/1.70 (+github actions)",
     "Accept": "application/json,*/*",
     "Accept-Encoding": "gzip, deflate",
 })
@@ -39,17 +40,19 @@ SESSION.headers.update({
 CI = os.getenv("GITHUB_ACTIONS") == "true"
 TIMEOUT_CONNECT = 4
 TIMEOUT_READ    = 6
-RETRIES         = 2 if CI else 4
-BACKOFF         = 1.4
-FETCH_DEADLINE_SEC = 18 if CI else 35
+RETRIES         = 1 if CI else 3
+BACKOFF         = 1.35
+FETCH_DEADLINE_SEC = 12 if CI else 25  # менші дедлайни → швидше фейлимось і переходимо далі
 
-# Vision bases
+# Vision (як останній резерв)
 VISION_DAILY   = "https://data.binance.vision/data/futures/um/daily/klines"
 VISION_MONTHLY = "https://data.binance.vision/data/futures/um/monthly/klines"
 
 SYMBOLS = ["BTCUSDT", "BTCUSDC"]
 TFS     = ["15m","1h","4h","1d"]
 LIMIT_PER_TF = 200
+
+_TF_SECONDS = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
 
 # ── HTTP helpers ───────────────────────────────────────────────────────────────
 def _is_json(resp): return "application/json" in (resp.headers.get("content-type") or "").lower()
@@ -67,7 +70,7 @@ def _http_get_json_from_bases(path: str, params: dict, bases: list[str], primary
         random.shuffle(arr)
 
     for base in arr:
-        for i in range(RETRIES):
+        for i in range(RETRIES + 1):
             if time.monotonic() - started > FETCH_DEADLINE_SEC:
                 raise TimeoutError(f"fetch_deadline_exceeded for {path} {params}")
             try:
@@ -81,19 +84,68 @@ def _http_get_json_from_bases(path: str, params: dict, bases: list[str], primary
                     url = f"{base}{path}"
                     r = SESSION.get(url, params=params, timeout=(TIMEOUT_CONNECT, TIMEOUT_READ), allow_redirects=False)
 
-                if r.status_code not in (200,203): last=f"bad_status:{r.status_code}"; time.sleep(BACKOFF**i); continue
+                if r.status_code not in (200, 203): last=f"bad_status:{r.status_code}"; time.sleep(BACKOFF**i); continue
                 if (not _is_json(r)) and ((r.content or b"")[:1]==b"<" or not r.content): last="non_json_200"; time.sleep(BACKOFF**i); continue
                 return r.json()
             except Exception as e:
-                last=str(e); time.sleep(BACKOFF**i); continue
+                last = str(e); time.sleep(BACKOFF**i); continue
     raise RuntimeError(f"_get_failed_after_retries:{last}")
 
-def _http_get_json_fapi(path:str, params:dict): return _http_get_json_from_bases(path, params, FAPI_BASES, FAPI_PRIMARY)
-def _http_get_json_spot(path: str, params: dict):
-    # тепер воркер теж використовується (primary_for_worker="https://api.binance.com")
-    return _http_get_json_from_bases(path, params, SPOT_BASES, primary_for_worker="https://api.binance.com")
-   
-# ── REST klines ────────────────────────────────────────────────────────────────
+def _http_get_json_spot(path:str, params:dict):
+    return _http_get_json_from_bases(path, params, SPOT_BASES, API_PRIMARY)
+
+def _http_get_json_fapi(path:str, params:dict):
+    return _http_get_json_from_bases(path, params, FAPI_BASES, FAPI_PRIMARY)
+
+# ── Utilities ──────────────────────────────────────────────────────────────────
+def _align_open_of_current(ts_utc: pd.Timestamp, interval: str) -> pd.Timestamp:
+    # повертає відкриття поточної, ще незакритої свічки (UTC)
+    if getattr(ts_utc, "tzinfo", None) is None:
+        ts = ts_utc.tz_localize("UTC")
+    else:
+        ts = ts_utc.tz_convert("UTC")
+    step = _TF_SECONDS.get(interval, 3600)
+    epoch = int(ts.timestamp())
+    open_cur = epoch - (epoch % step)
+    return pd.to_datetime(open_cur, unit="s", utc=True)
+
+def _validate_df(data, label: str) -> pd.DataFrame:
+    if not isinstance(data, list) or not data or not isinstance(data[0], (list,tuple)):
+        raise ValueError(f"Unexpected klines payload from {label}")
+    df = pd.DataFrame(data, columns=[
+        "openTime","open","high","low","close","volume",
+        "closeTime","qav","numTrades","takerBase","takerQuote","ignore"
+    ])
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df["ts"]    = pd.to_datetime(pd.to_numeric(df["closeTime"], errors="coerce"), unit="ms", utc=True)
+    df = df[["ts","close"]].dropna().sort_values("ts").reset_index(drop=True)
+    if df.empty: raise ValueError(f"Empty klines from {label}")
+    return df
+
+def _drop_unclosed(df: pd.DataFrame, interval: str) -> pd.DataFrame:
+    # залишаємо лише свічки, що закрились: ts < open_of_current
+    open_cur = _align_open_of_current(pd.Timestamp.now(tz=timezone.utc), interval)
+    df2 = df[df["ts"] < open_cur]
+    # на випадок, якщо API повернув порожньо після відсічення — лишимо останню свічку без змін (краще щось ніж нічого)
+    return df2 if not df2.empty else df
+
+# ── Spot klines (основне джерело) ─────────────────────────────────────────────
+def _spot_symbol(symbol: str) -> str:
+    s = (symbol or "").upper()
+    # Binance spot має BTCUSDT і BTCUSDC — лишаємо як є; інакше fallback на BTCUSDT
+    if s.endswith("USDT") or s.endswith("USDC"):
+        return s
+    return "BTCUSDT"
+
+def fetch_from_spot_klines(symbol: str, interval: str, limit: int) -> tuple[pd.DataFrame, str]:
+    sp_sym = _spot_symbol(symbol)
+    data = _http_get_json_spot("/api/v3/klines", {"symbol": sp_sym, "interval": interval, "limit": min(1000, limit + 5)})
+    df = _validate_df(data, f"spot_klines({sp_sym})")
+    df = _drop_unclosed(df, interval)
+    if len(df) > limit: df = df.iloc[-limit:].reset_index(drop=True)
+    return df, "spot_klines"
+
+# ── Futures klines (резерв) ───────────────────────────────────────────────────
 def _continuous_params(symbol: str) -> tuple[str,str]:
     sym=(symbol or "").upper()
     if sym in {"BTCUSDT","BTCUSDC"}: return sym,"PERPETUAL"
@@ -103,44 +155,21 @@ def _continuous_params(symbol: str) -> tuple[str,str]:
         return base, ct
     return sym, "PERPETUAL"
 
-def _validate_df(data, label: str) -> pd.DataFrame:
-    if not isinstance(data, list) or not data or not isinstance(data[0], (list,tuple)):
-        raise ValueError(f"Unexpected klines payload from {label}")
-    df=pd.DataFrame(data, columns=[
-        "openTime","open","high","low","close","volume",
-        "closeTime","qav","numTrades","takerBase","takerQuote","ignore"
-    ])
-    df["close"]=pd.to_numeric(df["close"], errors="coerce")
-    df["ts"]=pd.to_datetime(pd.to_numeric(df["closeTime"], errors="coerce"), unit="ms", utc=True)
-    df=df[["ts","close"]].dropna().sort_values("ts").reset_index(drop=True)  # <─ ключова правка: СОРТУЄМО
-    if df.empty: raise ValueError(f"Empty klines from {label}")
-    return df
-
-def fetch_from_binance_api(symbol:str, interval:str, limit:int) -> tuple[pd.DataFrame,str]:
+def fetch_from_futures_klines(symbol: str, interval: str, limit: int) -> tuple[pd.DataFrame, str]:
     params={"interval":interval,"limit":limit}
-    pair,ct=_continuous_params(symbol)
-    errors=[]
-
     try:
         data=_http_get_json_fapi("/fapi/v1/klines",{**params,"symbol":symbol})
-        return _validate_df(data,"klines"),"klines"
-    except Exception as e:
-        errors.append(f"klines:{e}")
-
-    try:
+        df=_validate_df(data,"futures_klines(klines)")
+        df=_drop_unclosed(df, interval)
+        return (df if len(df)<=limit else df.iloc[-limit:].reset_index(drop=True)), "futures_klines"
+    except Exception as e1:
+        pair,ct=_continuous_params(symbol)
         data=_http_get_json_fapi("/fapi/v1/continuousKlines",{**params,"pair":pair,"contractType":ct})
-        return _validate_df(data,"continuousKlines"),"continuousKlines"
-    except Exception as e:
-        errors.append(f"continuous:{e}")
+        df=_validate_df(data,"futures_klines(continuous)")
+        df=_drop_unclosed(df, interval)
+        return (df if len(df)<=limit else df.iloc[-limit:].reset_index(drop=True)), "futures_klines"
 
-    try:
-        data=_http_get_json_fapi("/fapi/v1/markPriceKlines",{**params,"symbol":symbol})
-        return _validate_df(data,"markPriceKlines"),"markPriceKlines"
-    except Exception as e:
-        errors.append(f"markPrice:{e}")
-        raise RuntimeError("; ".join(errors))
-
-# ── Vision monthly/daily ──────────────────────────────────────────────────────
+# ── Vision (останній резерв) ──────────────────────────────────────────────────
 def _vision_month_url(symbol:str, interval:str, y:int, m:int)->str:
     mm=f"{m:02d}"
     return f"{VISION_MONTHLY}/{symbol}/{interval}/{symbol}-{interval}-{y}-{mm}.zip"
@@ -160,7 +189,7 @@ def _csv_rows_from_bytes(b:bytes)->list[list]:
         out.append(row[:12])
     return out
 
-def _get_vision_zip(url:str)->list[list] | None:
+def _get_zip_rows(url:str)->list[list] | None:
     r=SESSION.get(url, timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
     if r.status_code==404: return None
     r.raise_for_status()
@@ -169,137 +198,68 @@ def _get_vision_zip(url:str)->list[list] | None:
         if not name: return None
         return _csv_rows_from_bytes(zf.read(name))
 
-def fetch_from_binance_vision(symbol:str, interval:str, limit:int)->tuple[pd.DataFrame,str]:
-    # 1) спочатку підтягуємо місячні архіви, від поточного місяця назад
+def fetch_from_vision(symbol:str, interval:str, limit:int)->tuple[pd.DataFrame,str]:
+    # Спробуємо 1–2 місяці + кілька останніх днів — лише як резерв, щоб не витрачати час
     today=datetime.utcnow().date()
-    rows: list[list]=[]
-    bars_per_day={"15m":96,"1h":24,"4h":6,"1d":1}.get(interval,24)
-    approx_per_month=bars_per_day*30
-    max_months=18  # достатньо для 200 daily
-    y, m=today.year, today.month
-
-    fetched_month=False
-    for k in range(max_months):
+    rows=[]
+    y,m=today.year,today.month
+    for k in range(2):
         yy= y if m-k>0 else y-((k-(m-1))//12+1)
         mm= ((m-k-1)%12)+1
         url=_vision_month_url(symbol, interval, yy, mm)
         try:
-            part=_get_vision_zip(url)
-            if part:
-                rows.extend(part); fetched_month=True
-                if len(rows)>=limit: break
+            part=_get_zip_rows(url)
+            if part: rows.extend(part)
         except Exception:
-            continue
-
-    # 2) на додачу — останні кілька днів (поточний місяць може бути неповним)
-    extra_days = max(0, math.ceil(limit - len(rows)))
-    days_needed = min(14, math.ceil(extra_days / bars_per_day) + 3)
-    for d in range(days_needed):
+            pass
+        if len(rows)>=limit: break
+    # кілька останніх днів (поточний місяць може бути неповний)
+    for d in range(7):
         day=today - timedelta(days=d)
         got=None
         for u in _vision_day_urls(symbol, interval, datetime.combine(day, datetime.min.time())):
             try:
-                if u.endswith(".zip"):
-                    got=_get_vision_zip(u)
-                else:
+                got=_get_zip_rows(u) if u.endswith(".zip") else None
+                if got is None:
                     r=SESSION.get(u, timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
-                    if r.status_code==404: got=None
-                    else:
+                    if r.status_code!=404:
                         r.raise_for_status(); got=_csv_rows_from_bytes(r.content)
             except Exception:
                 got=None
             if got: break
-        if got:
-            rows.extend(got)
-            if len(rows)>=limit: break
+        if got: rows.extend(got)
+        if len(rows)>=limit: break
 
-    if not rows:
-        raise RuntimeError("binance vision: no data retrieved")
-
-    df=_validate_df(rows,"binance_vision")  # тут ще раз сортуємо і чистимо
+    if not rows: raise RuntimeError("vision: no data")
+    df=_validate_df(rows,"binance_vision")
+    df=_drop_unclosed(df, interval)
     if len(df)>limit: df=df.iloc[-limit:].reset_index(drop=True)
     return df,"binance_vision"
 
-# ── Live tail (multi-source) ───────────────────────────────────────────────────
-def _try_live_price(symbol:str) -> tuple[float,str] | None:
-    # 1) Binance futures mark / last
+# ── Public fetch (spot → futures → vision) ─────────────────────────────────────
+def fetch_klines(symbol: str, interval: str, limit: int = LIMIT_PER_TF) -> tuple[pd.DataFrame, str]:
+    # 1) spot (швидко і стабільно через воркер)
     try:
-        j=_http_get_json_fapi("/fapi/v1/premiumIndex",{"symbol":symbol}); p=float(j.get("markPrice")); return p,"live_mark"
-    except Exception: pass
-    try:
-        j=_http_get_json_fapi("/fapi/v1/ticker/price",{"symbol":symbol}); p=float(j.get("price")); return p,"live_fapi"
-    except Exception: pass
-    # 2) Binance spot
-    try:
-        j=_http_get_json_spot("/api/v3/ticker/price",{"symbol": symbol if symbol.endswith("USDT") else "BTCUSDT"})
-        p=float(j.get("price")); return p,"live_spot"
-    except Exception: pass
-    # 3) OKX
-    try:
-        r=SESSION.get("https://www.okx.com/api/v5/market/ticker", params={"instId":"BTC-USDT"}, timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
-        r.raise_for_status(); j=r.json()
-        p=float(j["data"][0]["last"]); return p,"live_okx"
-    except Exception: pass
-    # 4) Bitstamp
-    try:
-        r=SESSION.get("https://www.bitstamp.net/api/v2/ticker/btcusdt", timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
-        r.raise_for_status(); j=r.json(); p=float(j["last"]); return p,"live_bitstamp"
-    except Exception: pass
-    # 5) Coinbase (Advanced)
-    try:
-        r=SESSION.get("https://api.exchange.coinbase.com/products/BTC-USD/ticker", timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
-        r.raise_for_status(); j=r.json(); p=float(j.get("price") or j.get("last")); return p,"live_coinbase"
-    except Exception: pass
-    # 6) Kraken
-    try:
-        r=SESSION.get("https://api.kraken.com/0/public/Ticker", params={"pair":"XBTUSDT"}, timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
-        r.raise_for_status(); j=r.json()
-        # В Kraken ключ трохи інший, але перше значення vwap/last у 'c'
-        val=list(j["result"].values())[0]["c"][0]; p=float(val); return p,"live_kraken"
-    except Exception: pass
-    return None
-
-_TF_SECONDS={"15m":900,"1h":3600,"4h":14400,"1d":86400}
-def _align_to_tf(ts_utc:pd.Timestamp, interval:str)->pd.Timestamp:
-    step=_TF_SECONDS.get(interval,3600); epoch=int(ts_utc.timestamp()); aligned=epoch - (epoch%step)
-    return pd.to_datetime(aligned, unit="s", utc=True)
-
-def _align_to_tf_boundary(ts_utc: pd.Timestamp, interval: str) -> pd.Timestamp:
-    # robust: якщо раптом naive — локалізуємо, якщо aware — конвертуємо
-    if getattr(ts_utc, "tz", None) is None:
-        ts = ts_utc.tz_localize("UTC")
+        return fetch_from_spot_klines(symbol, interval, limit)
+    except Exception as e_spot:
+        spot_err = str(e_spot)
     else:
-        ts = ts_utc.tz_convert("UTC")
-    step = _TF_SECONDS.get(interval, 3600)
-    epoch = int(ts.timestamp())
-    aligned = epoch - (epoch % step)
-    return pd.to_datetime(aligned, unit="s", utc=True)
-   
-def stitch_live_tail(df:pd.DataFrame, symbol:str, interval:str)->tuple[pd.DataFrame,str]:
-    probe=_try_live_price(symbol)
-    if not probe: return df,"binance_vision"  # без live
-    live,src=probe
-    now_aligned = _align_to_tf_boundary(pd.Timestamp.now(tz="UTC"), interval)
-    last_ts=df["ts"].iloc[-1]
-    if now_aligned>last_ts:
-        df2=pd.concat([df, pd.DataFrame([{"ts":now_aligned,"close":float(live)}])], ignore_index=True)
-    else:
-        df2=df.copy(); df2.loc[df2.index[-1],"close"]=float(live)
-    return df2,f"binance_vision+{src}"
+        spot_err = None
 
-# ── Public fetch ───────────────────────────────────────────────────────────────
-def fetch_klines(symbol:str, interval:str, limit:int=LIMIT_PER_TF)->tuple[pd.DataFrame,str]:
-    # 1) спроба через REST (якщо пощастить)
+    # 2) futures (якщо треба)
     try:
-        return fetch_from_binance_api(symbol, interval, limit)
-    except Exception as api_exc:
-        # 2) Vision (місячні+добові) + стіб живої ціни
-        try:
-            df,route=fetch_from_binance_vision(symbol, interval, limit)
-            df2,route2=stitch_live_tail(df, symbol, interval)
-            return df2, route2
-        except Exception as vis_exc:
-            raise RuntimeError(f"API chain failed: {api_exc}; Vision fallback failed: {vis_exc}") from vis_exc
+        return fetch_from_futures_klines(symbol, interval, limit)
+    except Exception as e_fut:
+        fut_err = str(e_fut)
+    else:
+        fut_err = None
+
+    # 3) vision (останній резерв)
+    try:
+        return fetch_from_vision(symbol, interval, limit)
+    except Exception as e_vis:
+        vis_err = str(e_vis)
+        raise RuntimeError(f"spot failed: {spot_err}; futures failed: {fut_err}; vision failed: {vis_err}")
 
 # ── Indicators ────────────────────────────────────────────────────────────────
 def ema(s,n):   return s.ewm(span=n, adjust=False).mean()
