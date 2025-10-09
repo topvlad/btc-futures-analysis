@@ -1,5 +1,5 @@
-# analyze.py (fix e_cont + Vision zip support + fapi5)
-import os, time, json, io, csv, zipfile
+# analyze.py (v1.32) — Vision headers fix + dynamic days back
+import os, time, json, io, csv, zipfile, math
 import requests
 import pandas as pd
 from datetime import datetime, timezone, timedelta
@@ -21,7 +21,7 @@ FAPI_BASES = [
 USE_CONTINUOUS = False
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "btc-futures-analysis/1.31 (+github actions)",
+    "User-Agent": "btc-futures-analysis/1.32 (+github actions)",
     "Accept": "application/json,*/*",
     "Accept-Encoding": "gzip, deflate",
 })
@@ -52,15 +52,12 @@ def _http_get_json(path: str, params: dict) -> dict | list:
     last_exc = None
 
     bases = FAPI_BASES[:]
-    # перемішуємо, але воркер — перший
     if CF_WORKER_BASE and bases and bases[0] == CF_WORKER_BASE:
         tail = bases[1:]
-        import random
-        random.shuffle(tail)
+        import random; random.shuffle(tail)
         bases = [CF_WORKER_BASE] + tail
     else:
-        import random
-        random.shuffle(bases)
+        import random; random.shuffle(bases)
 
     for base in bases:
         for i in range(RETRIES):
@@ -76,19 +73,13 @@ def _http_get_json(path: str, params: dict) -> dict | list:
                     r = SESSION.get(url, params=params, timeout=(TIMEOUT_CONNECT, TIMEOUT_READ), allow_redirects=False)
 
                 if r.status_code not in (200, 203):
-                    last_exc = f"bad_status:{r.status_code}"
-                    time.sleep(BACKOFF**i); continue
-
+                    last_exc = f"bad_status:{r.status_code}"; time.sleep(BACKOFF**i); continue
                 if (not _is_json_response(r)) and ((r.content or b"")[:1] == b"<" or not r.content):
-                    last_exc = "non_json_200"
-                    time.sleep(BACKOFF**i); continue
+                    last_exc = "non_json_200"; time.sleep(BACKOFF**i); continue
 
                 return r.json()
             except Exception as e:
-                last_exc = str(e)
-                time.sleep(BACKOFF**i)
-                continue
-
+                last_exc = str(e); time.sleep(BACKOFF**i); continue
     raise RuntimeError(f"_get_failed_after_retries:{last_exc}")
 
 
@@ -112,7 +103,7 @@ def _validate_klines_payload(data, route_label: str) -> pd.DataFrame:
         "closeTime","qav","numTrades","takerBase","takerQuote","ignore"
     ])
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
-    df["ts"]    = pd.to_datetime(df["closeTime"], unit="ms", utc=True)
+    df["ts"]    = pd.to_datetime(pd.to_numeric(df["closeTime"], errors="coerce"), unit="ms", utc=True)
     df = df[["ts","close"]].dropna().reset_index(drop=True)
     if df.empty: raise ValueError(f"Empty klines from {route_label}")
     return df
@@ -121,8 +112,7 @@ def _validate_klines_payload(data, route_label: str) -> pd.DataFrame:
 def fetch_from_binance_api(symbol: str, interval: str, limit: int) -> tuple[pd.DataFrame, str]:
     params = {"interval": interval, "limit": limit}
     pair, contract_type = _continuous_params_for_symbol(symbol)
-
-    errors = []  # збираємо тексти, щоб не падати на e_cont
+    errors = []
 
     if USE_CONTINUOUS:
         try:
@@ -131,21 +121,18 @@ def fetch_from_binance_api(symbol: str, interval: str, limit: int) -> tuple[pd.D
         except Exception as e:
             errors.append(f"continuous(forced): {e}")
 
-    # 1) klines
     try:
         data = _http_get_json("/fapi/v1/klines", {**params, "symbol": symbol})
         return _validate_klines_payload(data, "klines"), "klines"
     except Exception as e:
         errors.append(f"klines: {e}")
 
-    # 2) continuousKlines
     try:
         data = _http_get_json("/fapi/v1/continuousKlines", {**params, "pair": pair, "contractType": contract_type})
         return _validate_klines_payload(data, "continuousKlines (fallback)"), "continuousKlines (fallback)"
     except Exception as e:
         errors.append(f"continuous(fallback): {e}")
 
-    # 3) markPriceKlines
     try:
         data = _http_get_json("/fapi/v1/markPriceKlines", {**params, "symbol": symbol})
         return _validate_klines_payload(data, "markPriceKlines (fallback)"), "markPriceKlines (fallback)"
@@ -158,8 +145,19 @@ def fetch_from_binance_api(symbol: str, interval: str, limit: int) -> tuple[pd.D
 def _vision_urls(symbol: str, interval: str, date_obj: datetime) -> list[str]:
     d = date_obj.strftime("%Y-%m-%d")
     base = f"{VISION_BASE}/{symbol}/{interval}/{symbol}-{interval}-{d}"
-    # спочатку .zip (частіше існує), потім .csv
     return [base + ".zip", base + ".csv"]
+
+def _csv_rows_from_bytes(data_bytes: bytes) -> list[list]:
+    text = data_bytes.decode("utf-8", errors="replace")
+    rows = []
+    for row in csv.reader(io.StringIO(text)):
+        if not row: continue
+        # пропускаємо заголовок
+        if row[0].strip().lower() in ("open_time","open time"):
+            continue
+        if len(row) < 11: continue
+        rows.append(row[:12])
+    return rows
 
 def _try_vision_download(url: str) -> list[list] | None:
     r = SESSION.get(url, timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
@@ -168,26 +166,26 @@ def _try_vision_download(url: str) -> list[list] | None:
     r.raise_for_status()
     if url.endswith(".zip"):
         with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
-            # беремо перший CSV із архіву
             name = next((n for n in zf.namelist() if n.lower().endswith(".csv")), None)
             if not name: return None
-            data = zf.read(name).decode("utf-8", errors="replace")
+            return _csv_rows_from_bytes(zf.read(name))
     else:
-        data = r.content.decode("utf-8", errors="replace")
+        return _csv_rows_from_bytes(r.content)
 
-    rows = []
-    for row in csv.reader(io.StringIO(data)):
-        if not row or len(row) < 11:
-            continue
-        rows.append(row[:12])
-    return rows or None
+def _bars_per_day(interval: str) -> int:
+    return {
+        "15m": 96,
+        "1h": 24,
+        "4h": 6,
+        "1d": 1,
+    }.get(interval, 24)
 
 def fetch_from_binance_vision(symbol: str, interval: str, limit: int) -> tuple[pd.DataFrame, str]:
     today = datetime.utcnow().date()
+    need_days = min(400, math.ceil(limit / _bars_per_day(interval)) + 5)  # запас по днях
     all_rows: list[list] = []
 
-    # пройдемося назад до 14 днів, поки не вистачить рядків
-    for delta in range(0, 14):
+    for delta in range(0, need_days):
         day = today - timedelta(days=delta)
         got = None
         for url in _vision_urls(symbol, interval, datetime.combine(day, datetime.min.time())):
