@@ -20,6 +20,7 @@ FAPI_BASES = [
 ]
 
 SPOT_BASES = [
+    *([CF_WORKER_BASE] if CF_WORKER_BASE else []),
     "https://api.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
@@ -88,8 +89,10 @@ def _http_get_json_from_bases(path: str, params: dict, bases: list[str], primary
     raise RuntimeError(f"_get_failed_after_retries:{last}")
 
 def _http_get_json_fapi(path:str, params:dict): return _http_get_json_from_bases(path, params, FAPI_BASES, FAPI_PRIMARY)
-def _http_get_json_spot(path:str, params:dict): return _http_get_json_from_bases(path, params, SPOT_BASES, primary_for_worker=None)
-
+def _http_get_json_spot(path: str, params: dict):
+    # тепер воркер теж використовується (primary_for_worker="https://api.binance.com")
+    return _http_get_json_from_bases(path, params, SPOT_BASES, primary_for_worker="https://api.binance.com")
+   
 # ── REST klines ────────────────────────────────────────────────────────────────
 def _continuous_params(symbol: str) -> tuple[str,str]:
     sym=(symbol or "").upper()
@@ -261,11 +264,22 @@ def _align_to_tf(ts_utc:pd.Timestamp, interval:str)->pd.Timestamp:
     step=_TF_SECONDS.get(interval,3600); epoch=int(ts_utc.timestamp()); aligned=epoch - (epoch%step)
     return pd.to_datetime(aligned, unit="s", utc=True)
 
+def _align_to_tf_boundary(ts_utc: pd.Timestamp, interval: str) -> pd.Timestamp:
+    # robust: якщо раптом naive — локалізуємо, якщо aware — конвертуємо
+    if getattr(ts_utc, "tz", None) is None:
+        ts = ts_utc.tz_localize("UTC")
+    else:
+        ts = ts_utc.tz_convert("UTC")
+    step = _TF_SECONDS.get(interval, 3600)
+    epoch = int(ts.timestamp())
+    aligned = epoch - (epoch % step)
+    return pd.to_datetime(aligned, unit="s", utc=True)
+   
 def stitch_live_tail(df:pd.DataFrame, symbol:str, interval:str)->tuple[pd.DataFrame,str]:
     probe=_try_live_price(symbol)
     if not probe: return df,"binance_vision"  # без live
     live,src=probe
-    now_aligned=_align_to_tf(pd.Timestamp.utcnow().tz_localize("UTC"), interval)
+    now_aligned = _align_to_tf_boundary(pd.Timestamp.now(tz="UTC"), interval)
     last_ts=df["ts"].iloc[-1]
     if now_aligned>last_ts:
         df2=pd.concat([df, pd.DataFrame([{"ts":now_aligned,"close":float(live)}])], ignore_index=True)
