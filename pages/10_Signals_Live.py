@@ -1,75 +1,114 @@
-# pages/10_Signals_Live.py
-import asyncio
-import pandas as pd
-import streamlit as st
-from datetime import timedelta
+# pages/10_Signals_Live.py — v0.3
+import streamlit as st, pandas as pd, numpy as np, time
+from datetime import datetime, timezone
+from core.data_sources import (
+    fetch_klines, fetch_open_interest,
+    fetch_taker_longshort_ratio, fetch_premium_index_klines
+)
 
-from core.data_sources import fetch_klines, fetch_open_interest, fetch_taker_longshort_ratio, fetch_premium_index_klines, ws_stream
-from core.features import join_oi, join_taker, join_premium
-from core.signals import signal_impulse_participation, signal_funding_meanrev
+st.set_page_config(page_title="⚡ LIVE Signals", layout="wide")
 
-st.set_page_config(page_title="Signals LIVE", page_icon="⚡", layout="wide")
+# ============ Sidebar ============ #
+st.sidebar.header("Parameters (quick)")
+colA, colB = st.sidebar.columns(2)
+oi_min = colA.number_input("ΔOI% min (A)", 0.05, 5.0, 0.10, 0.05)
+oi_max = colB.number_input("", 0.5, 5.0, 2.00, 0.1)
+colC, colD = st.sidebar.columns(2)
+taker_min = colC.number_input("Taker ratio min (A)", 1.0, 3.0, 1.00, 0.05)
+taker_max = colD.number_input("", 1.0, 3.0, 1.50, 0.05)
+colE, colF = st.sidebar.columns(2)
+prem_z = colE.number_input("Premium z-threshold (B)", 0.5, 6.0, 1.00, 0.1)
+prem_z_hi = colF.number_input("", 0.5, 6.0, 4.00, 0.1)
 
+# ============ Legend ============ #
 st.title("⚡ LIVE Signals (1–5–15m)")
-symbol = st.text_input("Symbol", value="BTCUSDT").upper()
-colA, colB, colC = st.columns(3)
-interval = colA.selectbox("Interval", ["1m","5m","15m"], index=0)
-setup   = colB.selectbox("Setup", ["A: Impulse+Participation","B: Funding→MeanRev"], index=0)
-live    = colC.toggle("Start WebSocket", value=False)
+st.markdown("""
+### 🧭 Legend & Quick Guide
+**Setup A (Impulse + Participation)** — імпульси, коли Open Interest різко росте, а переважають агресивні лонги/шорти.  
+**Setup B (Premium Mean Reversion)** — контр-сигнал: коли премія фʼючерсу надто велика — очікується відкат.
 
-with st.sidebar:
-    st.subheader("Parameters (quick)")
-    d_oi_min = st.slider("ΔOI% min (A)", 0.1, 2.0, 0.5, 0.1)
-    taker_min = st.slider("Taker ratio min (A)", 1.00, 1.50, 1.10, 0.01)
-    prem_z = st.slider("Premium z-threshold (B)", 1.0, 4.0, 2.0, 0.1)
+- **ΔOI %** — зміна open interest між свічками (імпульс).  
+- **Taker ratio** — перевага агресорів (лонги/шорти).  
+- **Premium z-score** — наскільки премія вийшла за норму.  
+- **Signal strength** — зелений/червоний колір = сила напрямку.
+""")
+st.info("💡 Tip: комбінуй ці сигнали з головним BTC-дашбордом — якщо режим ринку *Trend ↑*, пріоритезуй лонги; якщо *Trend ↓* — шорти.")
 
-@st.cache_data(ttl=20)
-def _load_baseline(symbol: str, interval: str):
-    kl = fetch_klines(symbol, interval, limit=500)
-    oi = fetch_open_interest(symbol, "1m", limit=500)
-    tk = fetch_taker_longshort_ratio(symbol, "5m", limit=200)
-    pr = fetch_premium_index_klines(symbol, "1m", limit=500)
+# ============ Core logic ============ #
+symbol = st.selectbox("Symbol", ["BTCUSDT", "ETHUSDT"], index=0)
+interval = st.selectbox("Interval", ["1m", "5m", "15m"], index=0)
+setup = st.radio("Setup", ["A: Impulse + Participation", "B: Premium Mean Reversion"])
 
-    df = join_oi(kl, oi)
-    df = join_taker(df, tk)
-    df = join_premium(df, pr)
+@st.cache_data(ttl=120, show_spinner=False)
+def _load_baseline(symbol, interval):
+    kl = fetch_klines(symbol, interval, limit=200)
+    df = pd.DataFrame(kl)
+    df["return"] = df["close"].pct_change()
     return df
 
-placeholder = st.empty()
-log_ph = st.container()
+try:
+    df0 = _load_baseline(symbol, interval)
+except Exception as e:
+    st.error(f"Cannot load klines: {e}")
+    st.stop()
 
-def _render(df: pd.DataFrame):
-    if "A" in setup:
-        enriched = signal_impulse_participation(df, params={"d_oi_min": d_oi_min/100, "taker_ratio_min": taker_min})
-        sigs = enriched[["t","c","long_sig","short_sig","sl_long","tp_long","sl_short","tp_short"]].tail(50)
+def signal_a(df):
+    try:
+        oi_now = fetch_open_interest(symbol)
+        oi_prev = getattr(signal_a, "oi_prev", oi_now)
+        signal_a.oi_prev = oi_now
+        delta_oi = (oi_now - oi_prev) / max(oi_prev, 1e-9) * 100
+        ratio, acc_ratio, _ = fetch_taker_longshort_ratio(symbol, interval)
+        cond_up = delta_oi >= oi_min and ratio >= taker_min
+        cond_down = delta_oi >= oi_min and ratio <= (1 / taker_min)
+        if cond_up:
+            return "LONG", delta_oi, ratio
+        elif cond_down:
+            return "SHORT", delta_oi, ratio
+    except Exception:
+        return None, None, None
+    return None, None, None
+
+def signal_b(df):
+    try:
+        prem, _ = fetch_premium_index_klines(symbol, interval)
+        prem_series = getattr(signal_b, "prem_hist", [])
+        prem_series.append(prem)
+        if len(prem_series) > 20: prem_series.pop(0)
+        signal_b.prem_hist = prem_series
+        z = (prem - np.mean(prem_series)) / (np.std(prem_series) + 1e-9)
+        if abs(z) >= prem_z:
+            return ("SHORT" if z > 0 else "LONG"), prem, z
+    except Exception:
+        return None, None, None
+    return None, None, None
+
+def card(signal, val1, val2):
+    color = "#c8ffd0" if signal == "LONG" else "#ffd6d6"
+    emoji = "🚀" if signal == "LONG" else "🔻"
+    st.markdown(f"""
+    <div style='background:{color};padding:1em;border-radius:12px;margin:5px 0'>
+      <b style='font-size:22px'>{emoji} {signal} signal</b><br>
+      <span style='font-size:15px'>
+        ΔOI / Premium: <b>{val1:.3f}</b><br>
+        Ratio / z-score: <b>{val2:.3f}</b><br>
+        <i>{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>
+      </span>
+    </div>
+    """, unsafe_allow_html=True)
+
+# ============ Live loop ============ #
+ph = st.empty()
+st.markdown("### ⏱ Realtime feed (auto-refresh ≈ 10 s)")
+
+for _ in range(30):  # 5 min live
+    df = _load_baseline(symbol, interval)
+    if setup.startswith("A"):
+        sig, v1, v2 = signal_a(df)
     else:
-        enriched = signal_funding_meanrev(df, win_z=60, z_thr=prem_z)
-        sigs = enriched[["t","c","long_sig","short_sig","sl_long","tp_long","sl_short","tp_short","prem_z"]].tail(50)
-
-    with placeholder.container():
-        st.line_chart(enriched.set_index("t")[["c"]].tail(500))
-        st.dataframe(sigs, use_container_width=True)
-
-df0 = _load_baseline(symbol, interval)
-_render(df0)
-
-async def _run_ws():
-    async for ev in ws_stream(symbol, interval):
-        try:
-            stream = ev.get("stream","")
-            data   = ev.get("data",{})
-            if "kline" in stream:
-                k = data.get("k", {})
-                if k.get("x"):  # only on kline close
-                    # оновимо базу (легко і стабільно)
-                    df = _load_baseline(symbol, interval)
-                    _render(df)
-            elif "aggTrade" in stream:
-                # агр. трейди можна використати для майбутнього обрахунку taker-imbalance у реальному часі
-                pass
-        except Exception as e:
-            st.toast(f"WS error: {e}", icon="⚠️")
-
-if live:
-    st.info("WebSocket running… (оновлення по закриттю свічі)")
-    asyncio.run(_run_ws())
+        sig, v1, v2 = signal_b(df)
+    if sig:
+        card(sig, v1, v2)
+    else:
+        st.write("…no signal yet — waiting for conditions to trigger ⚙️")
+    time.sleep(10)
