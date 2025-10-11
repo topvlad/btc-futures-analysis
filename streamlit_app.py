@@ -50,6 +50,17 @@ if auto_refresh:
         pass
 st.sidebar.caption("Prices: Binance→OKX→Coinbase. FR/OI: Binance→OKX. Worker, if set, proxies Binance.")
 
+import os, streamlit as st
+st.sidebar.markdown("### Debug")
+try:
+    pages = os.listdir("pages")
+    core = os.listdir("core")
+    st.sidebar.write("📁 pages:", pages)
+    st.sidebar.write("📁 core:", core)
+except Exception as e:
+    st.sidebar.error(f"Cannot list dirs: {e}")
+
+
 # ========= HTTP helpers =========
 def build_worker_url(worker_base: str, full_upstream_url: str) -> str:
     if not worker_base: return full_upstream_url
