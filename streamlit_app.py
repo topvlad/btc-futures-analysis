@@ -1,5 +1,5 @@
 # streamlit_app.py
-# BTC dashboard: multi-TF regime & narrative, signal matrix, vol, funding/OI, and 24h news
+# BTC dashboard: multi-TF regime & narrative, signal matrix (RSI/RSI-MA), vol, funding/OI, and 24h news
 import os, json, math, time, re, requests, pandas as pd, numpy as np
 import streamlit as st
 from datetime import datetime, timezone, timedelta
@@ -31,10 +31,9 @@ FAPI_BASES = [
 CF_WORKER_DEFAULT = os.getenv("CF_WORKER_URL", "https://binance-proxy.brokerof-net.workers.dev")
 
 NEWS_FEEDS = [
-    # broad crypto news; we’ll keyword-filter to Bitcoin
     "https://news.google.com/rss/search?q=Bitcoin&hl=en-US&gl=US&ceid=US:en",
     "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml",
-    "https://cointelegraph.com/rss"
+    "https://cointelegraph.com/rss",
 ]
 NEWS_LOOKBACK_HOURS = 24
 
@@ -45,7 +44,7 @@ st.sidebar.header("Data Sources & Options")
 report_url = st.sidebar.text_input("GitHub Pages report.json", value=REPORT_URL_DEFAULT)
 cf_worker = st.sidebar.text_input("Cloudflare Worker (optional)", value=CF_WORKER_DEFAULT,
                                   help="If set, requests proxy via ?u=<upstream> on this worker.")
-extra_emas = st.sidebar.multiselect("Extra EMAs", options=[100, 400, 800], default=[400])
+extra_emas = st.sidebar.multiselect("Extra EMAs (on chart)", options=[100, 400, 800], default=[400])
 auto_refresh = st.sidebar.checkbox("Auto-refresh (60s)", value=False)
 if auto_refresh:
     st.experimental_set_query_params(_=int(time.time()))
@@ -81,7 +80,7 @@ def http_text(url: str, timeout=8):
     r.raise_for_status()
     return r.text
 
-# ======== report.json (for table only) ========
+# ======== report.json (debug table only) ========
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_report(url: str):
     r = requests.get(url, timeout=15); r.raise_for_status()
@@ -93,7 +92,6 @@ def fetch_report(url: str):
 # ======== Funding & OI (Binance → OKX fallback) ========
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_funding(symbol: str, limit: int = 48):
-    # Binance Futures (history)
     try:
         base = f"{FAPI_BASES[0]}/fapi/v1/fundingRate"
         if cf_worker:
@@ -109,7 +107,6 @@ def fetch_funding(symbol: str, limit: int = 48):
             return df, "binance"
     except Exception:
         pass
-    # OKX fallback (history)
     try:
         inst = "BTC-USDT-SWAP" if symbol.endswith("USDT") else "BTC-USDC-SWAP"
         j = http_json("https://www.okx.com/api/v5/public/funding-rate-history",
@@ -126,7 +123,6 @@ def fetch_funding(symbol: str, limit: int = 48):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_open_interest(symbol: str):
-    # Binance current OI
     try:
         base = f"{FAPI_BASES[0]}/fapi/v1/openInterest"
         if cf_worker:
@@ -140,7 +136,6 @@ def fetch_open_interest(symbol: str):
             return pd.DataFrame({"ts":[ts], "oi":[val]}), "binance"
     except Exception:
         pass
-    # OKX fallback (current OI)
     try:
         uly = "BTC-USDT" if symbol.endswith("USDT") else "BTC-USDC"
         j = http_json("https://www.okx.com/api/v5/public/open-interest",
@@ -213,13 +208,18 @@ def get_klines_df(symbol: str, interval: str, limit: int = 500):
 
 # ======== Indicators & helpers ========
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
-def rsi(s, n=14):
-    d = s.diff(); gain = d.clip(lower=0); loss = -d.clip(upper=0)
+
+def rsi_series(s, n=14):
+    d = s.diff()
+    gain = d.clip(lower=0); loss = -d.clip(upper=0)
     rs = gain.rolling(n).mean() / loss.rolling(n).mean()
     return 100 - (100/(1+rs))
+
 def macd(s, fast=12, slow=26, signal=9):
-    line = ema(s, fast) - ema(s, slow); sig = line.ewm(span=signal, adjust=False).mean()
+    line = ema(s, fast) - ema(s, slow)
+    sig = line.ewm(span=signal, adjust=False).mean()
     return line, sig, line - sig
+
 def adx(df, n=14):
     high, low, close = df["high"], df["low"], df["close"]
     up = high.diff(); down = -low.diff()
@@ -245,11 +245,14 @@ def drop_unclosed(df, interval):
 def trend_flags(df):
     s = df["close"]
     ema20 = ema(s,20); ema50 = ema(s,50); ema200 = ema(s,200)
+    rsi = rsi_series(s,14)
+    rsi_ma = rsi.rolling(5).mean()
     macd_line, macd_sig, macd_hist = macd(s)
     adx_val = adx(df,14)
     return {
         "ema20": float(ema20.iloc[-1]), "ema50": float(ema50.iloc[-1]), "ema200": float(ema200.iloc[-1]),
-        "rsi14": float(rsi(s,14).iloc[-1]),
+        "rsi14": float(rsi.iloc[-1]), "rsi_ma5": float(rsi_ma.iloc[-1]),
+        "rsi_cross": "✓" if rsi.iloc[-1] > rsi_ma.iloc[-1] else "×",
         "macd": float(macd_line.iloc[-1]), "macd_signal": float(macd_sig.iloc[-1]), "macd_hist": float(macd_hist.iloc[-1]),
         "adx14": float(adx_val.iloc[-1]),
         "price_vs_ema200": "above" if s.iloc[-1] > ema200.iloc[-1] else "below",
@@ -285,22 +288,21 @@ def kpretty(x):
 # ======== HEADER ========
 st.title("BTC — Regime, Signals & Futures Context")
 
-# ======== COLLAPSED INSTRUMENT (Symbol hidden), TF (for CHART) stays visible ========
+# ======== COLLAPSED INSTRUMENT (Symbol), Chart TF stays visible ========
 with st.expander("Instrument & options", expanded=False):
     symbol = st.selectbox("Symbol", SYMBOLS, index=0)
-    st.caption("TF below only affects the chart; the Signal Matrix and Narrative use **all TFs**.")
-# chart timeframe remains visible
+    st.caption("The Signal Matrix and Narrative always use **all TFs**. The selector below affects only the chart.")
 c_tf, c_bars = st.columns([1,1])
 chart_tf = c_tf.selectbox("Chart timeframe", TFS, index=TFS.index("1h"))
 limit = c_bars.slider("Bars (chart calc)", min_value=200, max_value=1000, value=500, step=100)
 
-# ======== LOAD report.json (only for debug table later) ========
+# ======== report.json (for debug table later) ========
 payload = None
 if report_url:
     try: payload = fetch_report(report_url)
     except Exception as e: st.warning(f"report.json load failed: {e}")
 
-# ======== CORE: get klines for ALL TFs (for matrix+narrative) ========
+# ======== CORE: fetch ALL TFs for matrix + narrative ========
 @st.cache_data(ttl=60, show_spinner=False)
 def get_all_tf_data(symbol: str, tfs: list[str], limit_each: int = 500):
     out = {}
@@ -312,33 +314,27 @@ def get_all_tf_data(symbol: str, tfs: list[str], limit_each: int = 500):
 
 try:
     tf_data = get_all_tf_data(symbol, TFS, limit_each=500)
-    # also get/chart df for selected chart_tf (reuse from cache)
     df_chart, src_chart = tf_data[chart_tf]
     last_ts = df_chart["ts"].iloc[-1]; last_close = float(df_chart["close"].iloc[-1])
     st.caption(f"Prices: **{src_chart}**  ·  Worker: {'ON' if cf_worker else 'OFF'}")
 except Exception as e:
     st.error(f"Klines failed: {e}"); st.stop()
 
-# ======== SIGNALS & HELICOPTER VIEW (per TF and aggregated) ========
-signals = {}
-for tf in TFS:
-    df = tf_data[tf][0]
-    signals[tf] = trend_flags(df)
+# ======== SIGNALS (per TF) & aggregate ========
+signals = {tf: trend_flags(tf_data[tf][0]) for tf in TFS}
 
-# aggregate regime
 def aggregate_regime(signals: dict):
-    score_sum, strong_trenders = 0, 0
+    score_sum, strong = 0, 0
     ups = downs = sides = 0
     for tf, s in signals.items():
         sc, conf, lab = regime_score(s)
         score_sum += sc
-        if conf in ("medium","high"): strong_trenders += 1
+        if conf in ("medium","high"): strong += 1
         if lab == "Trend ↑": ups += 1
         elif lab == "Trend ↓": downs += 1
         else: sides += 1
-    # label by majority vote
     label = "Trend ↑" if ups >= max(downs, sides) and ups >= 2 else ("Trend ↓" if downs >= max(ups, sides) and downs >= 2 else "Sideways")
-    conf = "high" if strong_trenders >= 3 else ("medium" if strong_trenders == 2 else "low")
+    conf = "high" if strong >= 3 else ("medium" if strong == 2 else "low")
     return {"label": label, "conf": conf, "ups": ups, "downs": downs, "sides": sides, "score_sum": score_sum}
 
 agg = aggregate_regime(signals)
@@ -367,7 +363,6 @@ def fetch_news(feeds: list[str], lookback_hours: int = 24, max_items: int = 8):
     for u in feeds:
         try:
             xml = http_text(u, timeout=8)
-            # very light RSS parse (title/link/pubDate)
             for item in re.findall(r"<item>(.*?)</item>", xml, flags=re.S|re.I):
                 title_match = re.search(r"<title>(.*?)</title>", item, flags=re.S|re.I)
                 link_match  = re.search(r"<link>(.*?)</link>", item, flags=re.S|re.I)
@@ -376,8 +371,7 @@ def fetch_news(feeds: list[str], lookback_hours: int = 24, max_items: int = 8):
                 link  = re.sub(r"<.*?>", "", (link_match.group(1).strip() if link_match else ""))
                 pub   = (date_match.group(1).strip() if date_match else None)
                 if not title or not link: continue
-                # filter by bitcoin keywords
-                if not re.search(r"\b(btc|bitcoin)\b", title, flags=re.I):
+                if not re.search(r"\b(btc|bitcoin)\b", title, flags=re.I):  # bitcoin-only filter
                     continue
                 try:
                     dt = parsedate_to_datetime(pub)
@@ -389,7 +383,6 @@ def fetch_news(feeds: list[str], lookback_hours: int = 24, max_items: int = 8):
                     out.append({"title": title, "link": link, "ts": dt, "src": u})
         except Exception:
             continue
-    # dedupe by link
     seen, dedup = set(), []
     for it in sorted(out, key=lambda x: x["ts"], reverse=True):
         if it["link"] in seen: continue
@@ -399,63 +392,63 @@ def fetch_news(feeds: list[str], lookback_hours: int = 24, max_items: int = 8):
 news_items = fetch_news(NEWS_FEEDS, NEWS_LOOKBACK_HOURS, max_items=8)
 news_risk = "normal"
 if news_items:
-    # naive risk heuristic
     bad_kw = r"(hack|exploit|liquidat|downtime|halt|delay|lawsuit|ban|shutdown|outage|security|ETF\s+delay|SEC\s+delay|CPI|rate\s+decision|halted)"
     if any(re.search(bad_kw, n["title"], flags=re.I) for n in news_items[:5]):
         news_risk = "elevated"
 
-# ======== NARRATIVE & DECISION (based on ALL TFs + FR + news) ========
-def tf_labs(signals):
-    labs = {tf: regime_score(signals[tf])[0:3] for tf in TFS}  # (score, conf, label)
-    return {tf: {"score": labs[tf][0], "conf": labs[tf][1], "label": labs[tf][2]} for tf in TFS}
-
-tfmeta = tf_labs(signals)
-
+# ======== NARRATIVE (plain language, multi-TF + FR + news) ========
 def narrative_playbook(agg, signals, funding_level, funding_side, news_risk):
-    bullets_long, bullets_short, bullets_manage = [], [], []
-    # Readiness based on majority & confidence
+    # easy helpers
+    def tf_rsi(tf): return signals[tf]["rsi14"]
+    def tf_above200(tf): return signals[tf]["price_vs_ema200"] == "above"
+
+    long_notes, short_notes, manage_notes = [], [], []
+
+    # Long ideas
     if agg["label"] == "Trend ↑" and agg["conf"] in ("medium","high"):
-        bullets_long.append("Bias **LONG-continuation**; prefer **buying pullbacks** to EMA20/EMA50 on intraday TFs.")
-        if funding_level in ("elevated","extreme") and funding_side.startswith("Longs"):
-            bullets_long.append("Funding **positive** → avoid chasing highs; scale in on dips / after minor reset.")
-    elif agg["label"] == "Trend ↓" and agg["conf"] in ("medium","high"):
-        bullets_short.append("Bias **SHORT-continuation**; prefer **selling rips** into EMA20/EMA50.")
-        if funding_level in ("elevated","extreme") and funding_side.startswith("Shorts"):
-            bullets_short.append("Funding **negative** → avoid chasing lows; use pops / failed retests.")
+        long_notes.append("Look to **buy a pullback** near EMA20/EMA50 on 15m–1h after a candle closes back above the line.")
+        long_notes.append("Place a **stop** a little **below the last swing low**. First targets are recent highs.")
     else:
-        bullets_long.append("Regime mixed: focus on **range trades**; look for failed breaks and mean reversion.")
-        bullets_short.append("Regime mixed: use **fade setups** at extremes; wait for alignment for trend plays.")
+        long_notes.append("Counter-trend long only if **1h closes back above EMA20** and forms a **higher low**. Use **smaller size**.")
 
-    # RSI stretch guide (use 1h + 4h)
-    for key_tf in ("1h","4h"):
-        s = signals[key_tf]
-        if s["rsi14"] >= 70: bullets_long.append(f"{key_tf} RSI>70: **stretched** — wait for dip / consolidation.")
-        if s["rsi14"] <= 30: bullets_short.append(f"{key_tf} RSI<30: **stretched** — wait for bounce / consolidation.")
+    # Short ideas
+    if agg["label"] == "Trend ↓" and agg["conf"] in ("medium","high"):
+        short_notes.append("Look to **sell a bounce** into EMA20/EMA50 on 15m–1h after a rejection candle.")
+        short_notes.append("Place a **stop** a little **above the last swing high**. First targets are recent lows.")
+    else:
+        short_notes.append("Counter-trend short only if **1h closes back below EMA20** and makes a **lower high**. Use **smaller size**.")
 
-    # ADX confidence note (use 4h + 1d)
-    for key_tf in ("4h","1d"):
-        s = signals[key_tf]
-        if s["adx14"] < 20: bullets_long.append(f"{key_tf} ADX<20: trend is **weak**; reduce size / seek confirmation.")
-        if s["adx14"] < 20: bullets_short.append(f"{key_tf} ADX<20: trend is **weak**; reduce size / seek confirmation.")
+    # RSI stretch guardrails (1h + 4h)
+    if tf_rsi("1h") >= 70 or tf_rsi("4h") >= 70:
+        long_notes.append("RSI hot (≥70): avoid buying breakouts; wait for a dip/consolidation.")
+    if tf_rsi("1h") <= 30 or tf_rsi("4h") <= 30:
+        short_notes.append("RSI cold (≤30): avoid shorting breakdowns; wait for a bounce/consolidation.")
 
-    # News risk injection
+    # Funding nudge
+    if funding_level in ("elevated","extreme"):
+        if funding_side.startswith("Longs"):
+            long_notes.append("Funding **positive**: don’t chase green candles; prefer entries **on dips**.")
+        elif funding_side.startswith("Shorts"):
+            short_notes.append("Funding **negative**: don’t chase red candles; prefer entries **on pops**.")
+
+    # News nudge
     if news_risk == "elevated":
-        bullets_long.append("**News risk elevated** (last 24h): favor tight risk / partial size.")
-        bullets_short.append("**News risk elevated** (last 24h): favor tight risk / partial size.")
+        long_notes.append("News risk high: use **smaller size** or wait 30–60 minutes after headlines.")
+        short_notes.append("News risk high: use **smaller size** or wait 30–60 minutes after headlines.")
 
-    # Position management if already in
+    # Management if already in
     if agg["label"] == "Trend ↑":
-        bullets_manage.append("If **already LONG**: trail below **EMA50 (1h)** / last higher-low; take partials into prior highs.")
-        bullets_manage.append("If **already SHORT**: avoid adding unless daily closes **below EMA200**; consider de-risk on strength.")
+        manage_notes.append("**If long:** move your stop just **below EMA50 (1h)** or the latest higher-low; take some profit near prior highs.")
+        manage_notes.append("**If short:** avoid adding unless price **closes below EMA200 (1d)**; consider taking risk off on strength.")
     elif agg["label"] == "Trend ↓":
-        bullets_manage.append("If **already SHORT**: trail above **EMA50 (1h)** / last lower-high; take partials into prior lows.")
-        bullets_manage.append("If **already LONG**: avoid adding unless daily reclaims **EMA200**; consider de-risk on weakness.")
+        manage_notes.append("**If short:** move your stop just **above EMA50 (1h)** or the latest lower-high; take some profit near prior lows.")
+        manage_notes.append("**If long:** avoid adding unless price **reclaims EMA200 (1d)**; consider taking risk off on weakness.")
     else:
-        bullets_manage.append("If in positions during **sideways**: reduce size, use range edges for adds/trim; avoid breakouts without follow-through.")
+        manage_notes.append("**Sideways:** keep positions smaller; add/trim at range edges; avoid fresh breakouts without follow-through.")
 
-    return bullets_long, bullets_short, bullets_manage
+    return long_notes, short_notes, manage_notes
 
-bl, bs, bm = narrative_playbook(agg, signals, funding_level, funding_side, news_risk)
+long_bul, short_bul, mgmt_bul = narrative_playbook(agg, signals, funding_level, funding_side, news_risk)
 
 with st.container():
     st.subheader("Narrative & decision (multi-TF synthesis)")
@@ -466,46 +459,88 @@ with st.container():
 """
     )
     cL, cS, cM = st.columns(3)
-    cL.markdown("**If considering LONG:**\n\n" + "\n".join([f"- {x}" for x in bl]) if bl else "- n/a")
-    cS.markdown("**If considering SHORT:**\n\n" + "\n".join([f"- {x}" for x in bs]) if bs else "- n/a")
-    cM.markdown("**If already IN (mgmt):**\n\n" + "\n".join([f"- {x}" for x in bm]) if bm else "- n/a")
+    cL.markdown("**If considering LONG:**\n\n" + ("\n".join([f"- {x}" for x in long_bul]) if long_bul else "- n/a"))
+    cS.markdown("**If considering SHORT:**\n\n" + ("\n".join([f"- {x}" for x in short_bul]) if short_bul else "- n/a"))
+    cM.markdown("**If already IN (management):**\n\n" + ("\n".join([f"- {x}" for x in mgmt_bul]) if mgmt_bul else "- n/a"))
 
-# ======== SIGNAL MATRIX (multi-TF) ========
+# ======== SIGNAL MATRIX (multi-TF) with richer columns + color coding ========
 def tf_row(tframe):
     df2, _src2 = tf_data[tframe]
     s2 = signals[tframe]
     score, conf2, lab2 = regime_score(s2)
     return {
-        "tf": tframe, "close": df2["close"].iloc[-1],
+        "tf": tframe,
+        "close": df2["close"].iloc[-1],
         "ema200_dir": "↑" if s2["price_vs_ema200"]=="above" else "↓",
         "ema20>50": "✓" if s2["ema20_cross_50"]=="bull" else "×",
         "macd": "✓" if s2["macd_cross"]=="bull" else "×",
-        "adx": s2["adx14"], "score": score, "conf": conf2, "label": lab2
+        "rsi": s2["rsi14"],
+        "rsi_ma5": s2["rsi_ma5"],
+        "rsi>ma5": s2["rsi_cross"],
+        "adx": s2["adx14"],
+        "score": score,
+        "conf": conf2,
+        "label": lab2
     }
 
 matrix_rows = [tf_row(t) for t in TFS]
 mat = pd.DataFrame(matrix_rows).set_index("tf")
+
+# ---- color helpers ----
 def color_yesno(val, yes="✓", no="×"):
-    if val == yes: return "background-color:#d1ffd6"
-    if val == no:  return "background-color:#ffd1d1"
+    if val == yes: return "background-color:#d1ffd6"      # green
+    if val == no:  return "background-color:#ffd1d1"      # red
     return ""
+
+def color_updown(val):
+    if val == "↑": return "background-color:#d1ffd6"
+    if val == "↓": return "background-color:#ffd1d1"
+    return ""
+
+def color_rsi(val):
+    try:
+        v = float(val)
+        if v >= 70:  return "background-color:#ffd1d1"    # overbought -> red (risk for longs)
+        if v <= 30:  return "background-color:#d1ffd6"    # oversold   -> green (risk for shorts)
+        return ""
+    except Exception:
+        return ""
+
+def color_adx(val):
+    try:
+        v = float(val)
+        if v >= 25: return "background-color:#d1ffd6"      # strong trend
+        if v >= 20: return "background-color:#fff2cc"      # building
+        return "background-color:#ffd1d1"                  # weak
+    except Exception:
+        return ""
+
 st.subheader("Signal matrix (multi-TF)")
-st.dataframe(mat.style.applymap(lambda v: color_yesno(v)).format({"close":"{:.2f}","adx":"{:.1f}"}), use_container_width=True)
+styled = (
+    mat.style
+      .applymap(color_updown, subset=["ema200_dir"])
+      .applymap(color_yesno, subset=["ema20>50","macd","rsi>ma5"])
+      .applymap(color_rsi, subset=["rsi","rsi_ma5"])
+      .applymap(color_adx, subset=["adx"])
+      .format({"close":"{:.2f}","rsi":"{:.1f}","rsi_ma5":"{:.1f}","adx":"{:.1f}"})
+)
+st.dataframe(styled, use_container_width=True)
 
 with st.expander("Legend", expanded=False):
     st.markdown(
         """
-- **ema200_dir (↑/↓)** — price above/below EMA200 (structural bias).  
+- **ema200_dir (↑/↓)** — price above/below EMA200 (big-picture bias).  
 - **ema20>50 (✓/×)** — short-term trend aligned with mid-term.  
-- **macd (✓/×)** — MACD line above/below signal (momentum bias).  
-- **ADX** — trend strength (≈ **<20** weak, **20–25** building, **>25** trending).  
-- **label/score** — aggregation into Trend ↑ / Sideways / Trend ↓.
+- **macd (✓/×)** — momentum bias (MACD line above/below signal).  
+- **rsi / rsi_ma5** — RSI(14) and its 5-bar moving average; **rsi>ma5** ✓ when RSI is rising vs its MA.  
+  - RSI **≥70** tinted red (hot), **≤30** tinted green (cold).  
+- **ADX** — trend strength (**<20** weak/red, **20–25** building/yellow, **>25** trending/green).  
+- **label/score/conf** — quick aggregation per TF.
         """.strip()
     )
 
 # ======== PRICE CHART (only uses chart_tf) ========
 with st.expander("Chart", expanded=True):
-    df_chart, _ = tf_data[chart_tf]
     s = df_chart.set_index("ts")["close"]
     ema20, ema50, ema200 = ema(s,20), ema(s,50), ema(s,200)
     if not PLOTLY:
