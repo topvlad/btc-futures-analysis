@@ -4,3 +4,4 @@ pandas>=2.2
 numpy>=1.26
 requests>=2.31
 plotly>=5.23
+websockets>=11.0
