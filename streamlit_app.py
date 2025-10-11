@@ -1,5 +1,5 @@
 # streamlit_app.py
-# BTC dashboard: multi-TF regime & narrative, signal matrix (RSI/RSI-MA), vol, funding/OI, and 24h news
+# BTC dashboard: multi-TF regime & narrative, enriched funding/OI, color-coded matrix w/ per-TF recommendation, 24h news
 import os, json, math, time, re, requests, pandas as pd, numpy as np
 import streamlit as st
 from datetime import datetime, timezone, timedelta
@@ -27,7 +27,6 @@ FAPI_BASES = [
     "https://fapi3.binance.com","https://fapi4.binance.com","https://fapi5.binance.com"
 ]
 
-# Default your Worker here (editable in UI)
 CF_WORKER_DEFAULT = os.getenv("CF_WORKER_URL", "https://binance-proxy.brokerof-net.workers.dev")
 
 NEWS_FEEDS = [
@@ -92,6 +91,7 @@ def fetch_report(url: str):
 # ======== Funding & OI (Binance → OKX fallback) ========
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_funding(symbol: str, limit: int = 48):
+    # Binance history
     try:
         base = f"{FAPI_BASES[0]}/fapi/v1/fundingRate"
         if cf_worker:
@@ -107,6 +107,7 @@ def fetch_funding(symbol: str, limit: int = 48):
             return df, "binance"
     except Exception:
         pass
+    # OKX history
     try:
         inst = "BTC-USDT-SWAP" if symbol.endswith("USDT") else "BTC-USDC-SWAP"
         j = http_json("https://www.okx.com/api/v5/public/funding-rate-history",
@@ -123,6 +124,7 @@ def fetch_funding(symbol: str, limit: int = 48):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_open_interest(symbol: str):
+    # Binance current
     try:
         base = f"{FAPI_BASES[0]}/fapi/v1/openInterest"
         if cf_worker:
@@ -136,6 +138,7 @@ def fetch_open_interest(symbol: str):
             return pd.DataFrame({"ts":[ts], "oi":[val]}), "binance"
     except Exception:
         pass
+    # OKX current
     try:
         uly = "BTC-USDT" if symbol.endswith("USDT") else "BTC-USDC"
         j = http_json("https://www.okx.com/api/v5/public/open-interest",
@@ -281,6 +284,21 @@ def funding_tilt(last_rate: float):
     bps = last_rate * 10000.0
     return f"{bps:+.2f} bps / 8h", level, side
 
+def per_tf_recommendation(sig):
+    """Return simple, readable action per TF."""
+    up = (sig["price_vs_ema200"]=="above")
+    align = (sig["ema20_cross_50"]=="bull")
+    mom = (sig["macd_cross"]=="bull")
+    adx_ok = sig["adx14"] >= 20
+    if up and align and mom and adx_ok:
+        return "Buy dips"
+    down = not up
+    align_dn = (sig["ema20_cross_50"]=="bear")
+    mom_dn = (sig["macd_cross"]=="bear")
+    if down and align_dn and mom_dn and adx_ok:
+        return "Sell rips"
+    return "Range trade"
+
 def kpretty(x):
     try: return f"{x:,.2f}"
     except Exception: return str(x)
@@ -288,21 +306,21 @@ def kpretty(x):
 # ======== HEADER ========
 st.title("BTC — Regime, Signals & Futures Context")
 
-# ======== COLLAPSED INSTRUMENT (Symbol), Chart TF stays visible ========
+# ======== INSTRUMENT (symbol), chart TF ========
 with st.expander("Instrument & options", expanded=False):
     symbol = st.selectbox("Symbol", SYMBOLS, index=0)
-    st.caption("The Signal Matrix and Narrative always use **all TFs**. The selector below affects only the chart.")
+    st.caption("Signal Matrix & Narrative always read **all TFs**. The selector below only affects the chart.")
 c_tf, c_bars = st.columns([1,1])
 chart_tf = c_tf.selectbox("Chart timeframe", TFS, index=TFS.index("1h"))
 limit = c_bars.slider("Bars (chart calc)", min_value=200, max_value=1000, value=500, step=100)
 
-# ======== report.json (for debug table later) ========
+# ======== report.json (debug) ========
 payload = None
 if report_url:
     try: payload = fetch_report(report_url)
     except Exception as e: st.warning(f"report.json load failed: {e}")
 
-# ======== CORE: fetch ALL TFs for matrix + narrative ========
+# ======== CORE: fetch ALL TFs ========
 @st.cache_data(ttl=60, show_spinner=False)
 def get_all_tf_data(symbol: str, tfs: list[str], limit_each: int = 500):
     out = {}
@@ -320,7 +338,7 @@ try:
 except Exception as e:
     st.error(f"Klines failed: {e}"); st.stop()
 
-# ======== SIGNALS (per TF) & aggregate ========
+# ======== SIGNALS & AGGREGATE ========
 signals = {tf: trend_flags(tf_data[tf][0]) for tf in TFS}
 
 def aggregate_regime(signals: dict):
@@ -349,11 +367,17 @@ cB.metric("Last Close", kpretty(last_close), last_ts.strftime("%Y-%m-%d %H:%M UT
 cC.metric(f"Realized Vol (20, {chart_tf})", f"{rv20*100:0.1f}%")
 cD.metric(f"Realized Vol (60, {chart_tf})", f"{rv60*100:0.1f}%")
 
-# ======== FUNDING & OI (for narrative) ========
+# ======== FUNDING & OI (for narrative and visuals) ========
 fdf, fsrc = fetch_funding(symbol, limit=48)
 odf, osrc = fetch_open_interest(symbol)
+
 last_funding = float(fdf["fundingRate"].iloc[-1]) if isinstance(fdf, pd.DataFrame) and not fdf.empty else None
 funding_str, funding_level, funding_side = funding_tilt(last_funding)
+
+# compute simple 24h funding mean (≈ last 3 entries of 8h)
+fund_mean_24h = None
+if isinstance(fdf, pd.DataFrame) and len(fdf) >= 3:
+    fund_mean_24h = float(fdf["fundingRate"].tail(3).mean())
 
 # ======== NEWS (last 24h) ========
 @st.cache_data(ttl=300, show_spinner=False)
@@ -396,78 +420,83 @@ if news_items:
     if any(re.search(bad_kw, n["title"], flags=re.I) for n in news_items[:5]):
         news_risk = "elevated"
 
-# ======== NARRATIVE (plain language, multi-TF + FR + news) ========
-def narrative_playbook(agg, signals, funding_level, funding_side, news_risk):
-    # easy helpers
-    def tf_rsi(tf): return signals[tf]["rsi14"]
-    def tf_above200(tf): return signals[tf]["price_vs_ema200"] == "above"
+# ======== STORY-LIKE NARRATIVE (data-driven) ========
+def narrative_story(agg, signals, funding_level, funding_side, fund_mean_24h, news_risk):
+    # snapshot lines
+    beam = "green" if agg["label"]=="Trend ↑" else ("red" if agg["label"]=="Trend ↓" else "grey")
+    # pick anchors
+    s1h, s4h, sd = signals["1h"], signals["4h"], signals["1d"]
+    tale = []
 
-    long_notes, short_notes, manage_notes = [], [], []
-
-    # Long ideas
-    if agg["label"] == "Trend ↑" and agg["conf"] in ("medium","high"):
-        long_notes.append("Look to **buy a pullback** near EMA20/EMA50 on 15m–1h after a candle closes back above the line.")
-        long_notes.append("Place a **stop** a little **below the last swing low**. First targets are recent highs.")
+    # opening
+    if agg["label"] == "Trend ↑":
+        tale.append("**Market tone:** buyers still have the ball. Most timeframes lean up, and momentum isn’t fighting them.")
+    elif agg["label"] == "Trend ↓":
+        tale.append("**Market tone:** sellers in charge. Rallies are getting sold and momentum backs the move.")
     else:
-        long_notes.append("Counter-trend long only if **1h closes back above EMA20** and forms a **higher low**. Use **smaller size**.")
+        tale.append("**Market tone:** balanced. Neither side can hold the lead for long — it’s a range until proven otherwise.")
 
-    # Short ideas
-    if agg["label"] == "Trend ↓" and agg["conf"] in ("medium","high"):
-        short_notes.append("Look to **sell a bounce** into EMA20/EMA50 on 15m–1h after a rejection candle.")
-        short_notes.append("Place a **stop** a little **above the last swing high**. First targets are recent lows.")
+    # body — structure & momentum
+    if sd["price_vs_ema200"] == "above":
+        tale.append("**Daily** holds above its long trend (EMA200): the big map is constructive.")
     else:
-        short_notes.append("Counter-trend short only if **1h closes back below EMA20** and makes a **lower high**. Use **smaller size**.")
+        tale.append("**Daily** lives below its long trend (EMA200): bigger map still leans defensive.")
 
-    # RSI stretch guardrails (1h + 4h)
-    if tf_rsi("1h") >= 70 or tf_rsi("4h") >= 70:
-        long_notes.append("RSI hot (≥70): avoid buying breakouts; wait for a dip/consolidation.")
-    if tf_rsi("1h") <= 30 or tf_rsi("4h") <= 30:
-        short_notes.append("RSI cold (≤30): avoid shorting breakdowns; wait for a bounce/consolidation.")
+    if s4h["ema20_cross_50"] == "bull":
+        tale.append("**4h** short-/mid-term lines (EMA20>EMA50) agree with the move.")
+    else:
+        tale.append("**4h** short-/mid-term lines disagree — move is fragile until they realign.")
 
-    # Funding nudge
+    if s1h["macd_cross"] == "bull":
+        tale.append("**1h** momentum points up; breakouts get a tailwind.")
+    else:
+        tale.append("**1h** momentum points down; fade entries work better than chasing.")
+
+    # stretch / strength
+    if s1h["rsi14"] >= 70 or s4h["rsi14"] >= 70:
+        tale.append("RSI reads **hot** on intraday — better to wait for a pause/dip before acting.")
+    if s1h["rsi14"] <= 30 or s4h["rsi14"] <= 30:
+        tale.append("RSI reads **cold** — breakdowns are slippery; let price bounce first.")
+
+    # funding context
     if funding_level in ("elevated","extreme"):
         if funding_side.startswith("Longs"):
-            long_notes.append("Funding **positive**: don’t chase green candles; prefer entries **on dips**.")
-        elif funding_side.startswith("Shorts"):
-            short_notes.append("Funding **negative**: don’t chase red candles; prefer entries **on pops**.")
+            tale.append("Funding is **positive**: positioning leans long — don’t buy green candles, buy **pullbacks**.")
+        else:
+            tale.append("Funding is **negative**: positioning leans short — don’t sell red candles, sell **pops**.")
+    if fund_mean_24h is not None:
+        tilt = "longs pay" if fund_mean_24h > 0 else ("shorts pay" if fund_mean_24h < 0 else "flat")
+        tale.append(f"Last 24h average funding: **{fund_mean_24h*100:.3f}%/8h** ({tilt}).")
 
-    # News nudge
+    # news note
     if news_risk == "elevated":
-        long_notes.append("News risk high: use **smaller size** or wait 30–60 minutes after headlines.")
-        short_notes.append("News risk high: use **smaller size** or wait 30–60 minutes after headlines.")
+        tale.append("**Headline risk is elevated** — keep size modest or wait for the dust to settle.")
 
-    # Management if already in
+    # actionable wrap
     if agg["label"] == "Trend ↑":
-        manage_notes.append("**If long:** move your stop just **below EMA50 (1h)** or the latest higher-low; take some profit near prior highs.")
-        manage_notes.append("**If short:** avoid adding unless price **closes below EMA200 (1d)**; consider taking risk off on strength.")
+        wrap = "Plan: **buy dips** into EMA20/50 on 15m–1h after a confirming candle; stops just **below** the last higher-low."
     elif agg["label"] == "Trend ↓":
-        manage_notes.append("**If short:** move your stop just **above EMA50 (1h)** or the latest lower-high; take some profit near prior lows.")
-        manage_notes.append("**If long:** avoid adding unless price **reclaims EMA200 (1d)**; consider taking risk off on weakness.")
+        wrap = "Plan: **sell rips** into EMA20/50 on 15m–1h after rejection; stops just **above** the last lower-high."
     else:
-        manage_notes.append("**Sideways:** keep positions smaller; add/trim at range edges; avoid fresh breakouts without follow-through.")
+        wrap = "Plan: **range trade** — buy near support, sell near resistance, and wait for a clean close outside with follow-through."
 
-    return long_notes, short_notes, manage_notes
+    return tale, wrap
 
-long_bul, short_bul, mgmt_bul = narrative_playbook(agg, signals, funding_level, funding_side, news_risk)
+tale_lines, action_wrap = narrative_story(agg, signals, funding_level, funding_side, fund_mean_24h, news_risk)
 
-with st.container():
-    st.subheader("Narrative & decision (multi-TF synthesis)")
-    st.markdown(
-        f"""
-**Aggregate Regime:** **{agg['label']}** (confidence: *{agg['conf']}*) · TF votes — ↑:{agg['ups']} / ↓:{agg['downs']} / ↔:{agg['sides']}  
-**Funding tilt:** **{funding_str}** — *{funding_level}*, **{funding_side}** · **News risk:** *{news_risk}*
-"""
-    )
-    cL, cS, cM = st.columns(3)
-    cL.markdown("**If considering LONG:**\n\n" + ("\n".join([f"- {x}" for x in long_bul]) if long_bul else "- n/a"))
-    cS.markdown("**If considering SHORT:**\n\n" + ("\n".join([f"- {x}" for x in short_bul]) if short_bul else "- n/a"))
-    cM.markdown("**If already IN (management):**\n\n" + ("\n".join([f"- {x}" for x in mgmt_bul]) if mgmt_bul else "- n/a"))
+st.subheader("Narrative & decision (multi-TF synthesis)")
+st.markdown(
+    f"**Aggregate Regime:** **{agg['label']}** (confidence: *{agg['conf']}*) · TF votes — ↑:{agg['ups']} / ↓:{agg['downs']} / ↔:{agg['sides']}  \n"
+    f"**Funding tilt:** *{funding_str}* — *{funding_level}*, **{funding_side}** · **News risk:** *{news_risk}*"
+)
+st.markdown("\n".join([f"- {line}" for line in tale_lines] + [f"\n**{action_wrap}**"]))
 
-# ======== SIGNAL MATRIX (multi-TF) with richer columns + color coding ========
+# ======== SIGNAL MATRIX (multi-TF) with RSI/RSI-MA & per-TF recommendation ========
 def tf_row(tframe):
     df2, _src2 = tf_data[tframe]
     s2 = signals[tframe]
     score, conf2, lab2 = regime_score(s2)
+    rec = per_tf_recommendation(s2)
     return {
         "tf": tframe,
         "close": df2["close"].iloc[-1],
@@ -480,7 +509,8 @@ def tf_row(tframe):
         "adx": s2["adx14"],
         "score": score,
         "conf": conf2,
-        "label": lab2
+        "label": lab2,
+        "recommend": rec
     }
 
 matrix_rows = [tf_row(t) for t in TFS]
@@ -500,8 +530,8 @@ def color_updown(val):
 def color_rsi(val):
     try:
         v = float(val)
-        if v >= 70:  return "background-color:#ffd1d1"    # overbought -> red (risk for longs)
-        if v <= 30:  return "background-color:#d1ffd6"    # oversold   -> green (risk for shorts)
+        if v >= 70:  return "background-color:#ffd1d1"    # hot
+        if v <= 30:  return "background-color:#d1ffd6"    # cold
         return ""
     except Exception:
         return ""
@@ -509,11 +539,16 @@ def color_rsi(val):
 def color_adx(val):
     try:
         v = float(val)
-        if v >= 25: return "background-color:#d1ffd6"      # strong trend
-        if v >= 20: return "background-color:#fff2cc"      # building
-        return "background-color:#ffd1d1"                  # weak
+        if v >= 25: return "background-color:#d1ffd6"
+        if v >= 20: return "background-color:#fff2cc"
+        return "background-color:#ffd1d1"
     except Exception:
         return ""
+
+def color_rec(val):
+    if val == "Buy dips":  return "background-color:#d1ffd6"
+    if val == "Sell rips": return "background-color:#ffd1d1"
+    return "background-color:#fff2cc"  # range trade
 
 st.subheader("Signal matrix (multi-TF)")
 styled = (
@@ -522,6 +557,7 @@ styled = (
       .applymap(color_yesno, subset=["ema20>50","macd","rsi>ma5"])
       .applymap(color_rsi, subset=["rsi","rsi_ma5"])
       .applymap(color_adx, subset=["adx"])
+      .applymap(color_rec, subset=["recommend"])
       .format({"close":"{:.2f}","rsi":"{:.1f}","rsi_ma5":"{:.1f}","adx":"{:.1f}"})
 )
 st.dataframe(styled, use_container_width=True)
@@ -529,13 +565,11 @@ st.dataframe(styled, use_container_width=True)
 with st.expander("Legend", expanded=False):
     st.markdown(
         """
-- **ema200_dir (↑/↓)** — price above/below EMA200 (big-picture bias).  
-- **ema20>50 (✓/×)** — short-term trend aligned with mid-term.  
-- **macd (✓/×)** — momentum bias (MACD line above/below signal).  
-- **rsi / rsi_ma5** — RSI(14) and its 5-bar moving average; **rsi>ma5** ✓ when RSI is rising vs its MA.  
-  - RSI **≥70** tinted red (hot), **≤30** tinted green (cold).  
-- **ADX** — trend strength (**<20** weak/red, **20–25** building/yellow, **>25** trending/green).  
-- **label/score/conf** — quick aggregation per TF.
+- **ema200_dir (↑/↓)** — above/below EMA200 (big-picture bias).  
+- **ema20>50, macd, rsi>ma5 (✓/×)** — alignment of short-term trend, momentum, RSI direction.  
+- **RSI / RSI-MA5** — RSI(14) and its 5-bar average (green ≤30, red ≥70).  
+- **ADX** — trend strength (green >25, yellow 20–25, red <20).  
+- **recommend** — quick per-TF action: **Buy dips / Sell rips / Range trade**.
         """.strip()
     )
 
@@ -561,13 +595,16 @@ with st.expander("Chart", expanded=True):
         fig.update_layout(height=520, margin=dict(l=10,r=10,t=30,b=10), xaxis_rangeslider_visible=False)
         st.plotly_chart(fig, use_container_width=True)
 
-# ======== FUNDING & OI PANELS ========
+# ======== FUNDING & OI PANELS (now with details & reflection) ========
 with st.expander("Funding & Open Interest (Futures context)"):
     fcol, ocol = st.columns(2)
     try:
         if isinstance(fdf, pd.DataFrame) and not fdf.empty:
             last_f = fdf["fundingRate"].iloc[-1]*100
             fcol.metric(f"Last funding ({fsrc})", f"{last_f:.4f}% / 8h")
+            # 24h mean & who-pays
+            if fund_mean_24h is not None:
+                fcol.caption(f"24h mean: {fund_mean_24h*100:.4f}% / 8h  ·  bias: {'longs pay' if fund_mean_24h>0 else ('shorts pay' if fund_mean_24h<0 else 'flat')}")
             fcol.line_chart(fdf.set_index("fundingTime")["fundingRate"]*100, height=160)
         else:
             fcol.info("No funding data.")
@@ -577,6 +614,7 @@ with st.expander("Funding & Open Interest (Futures context)"):
     try:
         if isinstance(odf, pd.DataFrame) and not odf.empty:
             ocol.metric(f"Open interest ({osrc})", f"{float(odf['oi'].iloc[-1]):,.0f}")
+            ocol.caption("Snapshot only (no public OI history in this view).")
         else:
             ocol.info("No OI data.")
     except Exception as e:
