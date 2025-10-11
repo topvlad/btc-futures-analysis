@@ -1,9 +1,10 @@
 # streamlit_app.py
-# BTC dashboard with helicopter view, signal matrix, vol, funding & OI + narrative/decision box
-import os, json, math, time, requests, pandas as pd, numpy as np
+# BTC dashboard: multi-TF regime & narrative, signal matrix, vol, funding/OI, and 24h news
+import os, json, math, time, re, requests, pandas as pd, numpy as np
 import streamlit as st
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
+from email.utils import parsedate_to_datetime
 
 try:
     import plotly.graph_objects as go
@@ -28,6 +29,14 @@ FAPI_BASES = [
 
 # Default your Worker here (editable in UI)
 CF_WORKER_DEFAULT = os.getenv("CF_WORKER_URL", "https://binance-proxy.brokerof-net.workers.dev")
+
+NEWS_FEEDS = [
+    # broad crypto news; we’ll keyword-filter to Bitcoin
+    "https://news.google.com/rss/search?q=Bitcoin&hl=en-US&gl=US&ceid=US:en",
+    "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml",
+    "https://cointelegraph.com/rss"
+]
+NEWS_LOOKBACK_HOURS = 24
 
 st.set_page_config(page_title="BTC — Regime, Signals & Futures Context", layout="wide")
 
@@ -66,6 +75,11 @@ def http_json(url: str, params=None, timeout=8, allow_worker=False):
         except Exception as e:
             last_e = str(e); continue
     raise RuntimeError(f"http_json failed: {last_e}")
+
+def http_text(url: str, timeout=8):
+    r = requests.get(url, timeout=timeout)
+    r.raise_for_status()
+    return r.text
 
 # ======== report.json (for table only) ========
 @st.cache_data(ttl=300, show_spinner=False)
@@ -186,6 +200,7 @@ def _coinbase_klines(symbol: str, interval: str, limit: int):
     if not isinstance(data, list) or not data: raise RuntimeError("Coinbase empty")
     return _to_df_coinbase(data), "coinbase"
 
+@st.cache_data(ttl=60, show_spinner=False)
 def get_klines_df(symbol: str, interval: str, limit: int = 500):
     errs=[]
     try: df, src = _binance_spot_klines(symbol, interval, limit, cf_worker); return df, src
@@ -256,7 +271,6 @@ def regime_score(sig):
     return score, conf, label
 
 def funding_tilt(last_rate: float):
-    # rate is per 8h (e.g., 0.0001 = 0.01%)
     if last_rate is None: return "unknown", "n/a", "n/a"
     mag = abs(last_rate)
     level = "neutral" if mag < 0.0001 else ("elevated" if mag < 0.0005 else "extreme")  # 0.01% / 0.05%
@@ -271,95 +285,195 @@ def kpretty(x):
 # ======== HEADER ========
 st.title("BTC — Regime, Signals & Futures Context")
 
-# ======== COLLAPSED INSTRUMENT (Symbol hidden), TF stays visible ========
+# ======== COLLAPSED INSTRUMENT (Symbol hidden), TF (for CHART) stays visible ========
 with st.expander("Instrument & options", expanded=False):
     symbol = st.selectbox("Symbol", SYMBOLS, index=0)
-    st.caption("Tip: leave TF in the top bar; instrument lives here to keep the main view clean.")
-# keep TF visible
+    st.caption("TF below only affects the chart; the Signal Matrix and Narrative use **all TFs**.")
+# chart timeframe remains visible
 c_tf, c_bars = st.columns([1,1])
-tf = c_tf.selectbox("Timeframe", TFS, index=TFS.index("1h"))
+chart_tf = c_tf.selectbox("Chart timeframe", TFS, index=TFS.index("1h"))
 limit = c_bars.slider("Bars (chart calc)", min_value=200, max_value=1000, value=500, step=100)
 
-# ======== LOAD report.json (only for comparison table later) ========
+# ======== LOAD report.json (only for debug table later) ========
 payload = None
 if report_url:
     try: payload = fetch_report(report_url)
     except Exception as e: st.warning(f"report.json load failed: {e}")
 
-# ======== KLINES (multi-provider) ========
+# ======== CORE: get klines for ALL TFs (for matrix+narrative) ========
+@st.cache_data(ttl=60, show_spinner=False)
+def get_all_tf_data(symbol: str, tfs: list[str], limit_each: int = 500):
+    out = {}
+    for tf in tfs:
+        df, src = get_klines_df(symbol, tf, limit=limit_each)
+        df = drop_unclosed(df, tf)
+        out[tf] = (df, src)
+    return out
+
 try:
-    df, src = get_klines_df(symbol, tf, limit=limit+5)
-    df = drop_unclosed(df, tf)
-    last_ts = df["ts"].iloc[-1]; last_close = float(df["close"].iloc[-1])
-    st.caption(f"Prices: **{src}**  ·  Worker: {'ON' if cf_worker else 'OFF'}")
+    tf_data = get_all_tf_data(symbol, TFS, limit_each=500)
+    # also get/chart df for selected chart_tf (reuse from cache)
+    df_chart, src_chart = tf_data[chart_tf]
+    last_ts = df_chart["ts"].iloc[-1]; last_close = float(df_chart["close"].iloc[-1])
+    st.caption(f"Prices: **{src_chart}**  ·  Worker: {'ON' if cf_worker else 'OFF'}")
 except Exception as e:
     st.error(f"Klines failed: {e}"); st.stop()
 
-# ======== SIGNALS & HELICOPTER VIEW ========
-sig = trend_flags(df)
-sc, conf, label = regime_score(sig)
-rv20 = realized_vol(df.set_index("ts")["close"], 20)
-rv60 = realized_vol(df.set_index("ts")["close"], 60)
+# ======== SIGNALS & HELICOPTER VIEW (per TF and aggregated) ========
+signals = {}
+for tf in TFS:
+    df = tf_data[tf][0]
+    signals[tf] = trend_flags(df)
+
+# aggregate regime
+def aggregate_regime(signals: dict):
+    score_sum, strong_trenders = 0, 0
+    ups = downs = sides = 0
+    for tf, s in signals.items():
+        sc, conf, lab = regime_score(s)
+        score_sum += sc
+        if conf in ("medium","high"): strong_trenders += 1
+        if lab == "Trend ↑": ups += 1
+        elif lab == "Trend ↓": downs += 1
+        else: sides += 1
+    # label by majority vote
+    label = "Trend ↑" if ups >= max(downs, sides) and ups >= 2 else ("Trend ↓" if downs >= max(ups, sides) and downs >= 2 else "Sideways")
+    conf = "high" if strong_trenders >= 3 else ("medium" if strong_trenders == 2 else "low")
+    return {"label": label, "conf": conf, "ups": ups, "downs": downs, "sides": sides, "score_sum": score_sum}
+
+agg = aggregate_regime(signals)
+
+# vol on chart TF
+rv20 = realized_vol(df_chart.set_index("ts")["close"], 20)
+rv60 = realized_vol(df_chart.set_index("ts")["close"], 60)
 
 cA, cB, cC, cD = st.columns([1.2, 1.2, 1.2, 1.2])
-cA.metric("Regime", f"{label}", f"conf: {conf}")
+cA.metric("Regime (aggregate)", f"{agg['label']}", f"conf: {agg['conf']}")
 cB.metric("Last Close", kpretty(last_close), last_ts.strftime("%Y-%m-%d %H:%M UTC"))
-cC.metric("Realized Vol (20)", f"{rv20*100:0.1f}%")
-cD.metric("Realized Vol (60)", f"{rv60*100:0.1f}%")
+cC.metric(f"Realized Vol (20, {chart_tf})", f"{rv20*100:0.1f}%")
+cD.metric(f"Realized Vol (60, {chart_tf})", f"{rv60*100:0.1f}%")
 
-# ======== NARRATIVE & DECISION (concise) ========
-with st.container():
-    # funding / OI
-    fdf, fsrc = fetch_funding(symbol, limit=48)
-    odf, osrc = fetch_open_interest(symbol)
-    last_funding = None
-    if isinstance(fdf, pd.DataFrame) and not fdf.empty:
-        last_funding = float(fdf["fundingRate"].iloc[-1])
-    funding_str, funding_level, funding_side = funding_tilt(last_funding)
+# ======== FUNDING & OI (for narrative) ========
+fdf, fsrc = fetch_funding(symbol, limit=48)
+odf, osrc = fetch_open_interest(symbol)
+last_funding = float(fdf["fundingRate"].iloc[-1]) if isinstance(fdf, pd.DataFrame) and not fdf.empty else None
+funding_str, funding_level, funding_side = funding_tilt(last_funding)
 
-    bullets = []
-    # core regime logic
-    if label == "Trend ↑" and conf in ("medium","high") and sig["price_vs_ema200"]=="above" and sig["ema20_cross_50"]=="bull":
-        bullets.append("Bias: **pro-trend long on pullbacks** to EMA20/EMA50; invalidate on close below EMA50.")
-    elif label == "Trend ↓" and conf in ("medium","high") and sig["price_vs_ema200"]=="below":
-        bullets.append("Bias: **pro-trend short on bounces** to EMA20/EMA50; invalidate on close above EMA50.")
+# ======== NEWS (last 24h) ========
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_news(feeds: list[str], lookback_hours: int = 24, max_items: int = 8):
+    out = []
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    for u in feeds:
+        try:
+            xml = http_text(u, timeout=8)
+            # very light RSS parse (title/link/pubDate)
+            for item in re.findall(r"<item>(.*?)</item>", xml, flags=re.S|re.I):
+                title_match = re.search(r"<title>(.*?)</title>", item, flags=re.S|re.I)
+                link_match  = re.search(r"<link>(.*?)</link>", item, flags=re.S|re.I)
+                date_match  = re.search(r"<pubDate>(.*?)</pubDate>", item, flags=re.S|re.I)
+                title = re.sub(r"<.*?>", "", (title_match.group(1).strip() if title_match else ""))
+                link  = re.sub(r"<.*?>", "", (link_match.group(1).strip() if link_match else ""))
+                pub   = (date_match.group(1).strip() if date_match else None)
+                if not title or not link: continue
+                # filter by bitcoin keywords
+                if not re.search(r"\b(btc|bitcoin)\b", title, flags=re.I):
+                    continue
+                try:
+                    dt = parsedate_to_datetime(pub)
+                    if not dt.tzinfo: dt = dt.replace(tzinfo=timezone.utc)
+                    dt = dt.astimezone(timezone.utc)
+                except Exception:
+                    dt = datetime.now(timezone.utc)
+                if dt >= cutoff:
+                    out.append({"title": title, "link": link, "ts": dt, "src": u})
+        except Exception:
+            continue
+    # dedupe by link
+    seen, dedup = set(), []
+    for it in sorted(out, key=lambda x: x["ts"], reverse=True):
+        if it["link"] in seen: continue
+        seen.add(it["link"]); dedup.append(it)
+    return dedup[:max_items]
+
+news_items = fetch_news(NEWS_FEEDS, NEWS_LOOKBACK_HOURS, max_items=8)
+news_risk = "normal"
+if news_items:
+    # naive risk heuristic
+    bad_kw = r"(hack|exploit|liquidat|downtime|halt|delay|lawsuit|ban|shutdown|outage|security|ETF\s+delay|SEC\s+delay|CPI|rate\s+decision|halted)"
+    if any(re.search(bad_kw, n["title"], flags=re.I) for n in news_items[:5]):
+        news_risk = "elevated"
+
+# ======== NARRATIVE & DECISION (based on ALL TFs + FR + news) ========
+def tf_labs(signals):
+    labs = {tf: regime_score(signals[tf])[0:3] for tf in TFS}  # (score, conf, label)
+    return {tf: {"score": labs[tf][0], "conf": labs[tf][1], "label": labs[tf][2]} for tf in TFS}
+
+tfmeta = tf_labs(signals)
+
+def narrative_playbook(agg, signals, funding_level, funding_side, news_risk):
+    bullets_long, bullets_short, bullets_manage = [], [], []
+    # Readiness based on majority & confidence
+    if agg["label"] == "Trend ↑" and agg["conf"] in ("medium","high"):
+        bullets_long.append("Bias **LONG-continuation**; prefer **buying pullbacks** to EMA20/EMA50 on intraday TFs.")
+        if funding_level in ("elevated","extreme") and funding_side.startswith("Longs"):
+            bullets_long.append("Funding **positive** → avoid chasing highs; scale in on dips / after minor reset.")
+    elif agg["label"] == "Trend ↓" and agg["conf"] in ("medium","high"):
+        bullets_short.append("Bias **SHORT-continuation**; prefer **selling rips** into EMA20/EMA50.")
+        if funding_level in ("elevated","extreme") and funding_side.startswith("Shorts"):
+            bullets_short.append("Funding **negative** → avoid chasing lows; use pops / failed retests.")
     else:
-        bullets.append("Bias: **range/mean-revert**; fade extremes near prior swing/EMA bands; wait for alignment.")
+        bullets_long.append("Regime mixed: focus on **range trades**; look for failed breaks and mean reversion.")
+        bullets_short.append("Regime mixed: use **fade setups** at extremes; wait for alignment for trend plays.")
 
-    # momentum & stretch
-    if sig["rsi14"] >= 70:
-        bullets.append("RSI>70: **stretched** — prefer **buy dips** only, avoid chasing highs.")
-    if sig["rsi14"] <= 30:
-        bullets.append("RSI<30: **stretched** — prefer **sell rips** only, avoid chasing lows.")
+    # RSI stretch guide (use 1h + 4h)
+    for key_tf in ("1h","4h"):
+        s = signals[key_tf]
+        if s["rsi14"] >= 70: bullets_long.append(f"{key_tf} RSI>70: **stretched** — wait for dip / consolidation.")
+        if s["rsi14"] <= 30: bullets_short.append(f"{key_tf} RSI<30: **stretched** — wait for bounce / consolidation.")
 
-    # funding guidance
-    if funding_level == "extreme":
-        if last_funding and last_funding > 0:
-            bullets.append("Funding **very positive** (longs paying): late-long risk ↑; prefer **pullbacks** or wait for cooling.")
-        elif last_funding and last_funding < 0:
-            bullets.append("Funding **very negative** (shorts paying): **squeeze risk** ↑ on upside breaks; size cautiously.")
-    elif funding_level == "elevated":
-        bullets.append("Funding **elevated**: trend ok but watch for **overcrowding** on the dominant side.")
+    # ADX confidence note (use 4h + 1d)
+    for key_tf in ("4h","1d"):
+        s = signals[key_tf]
+        if s["adx14"] < 20: bullets_long.append(f"{key_tf} ADX<20: trend is **weak**; reduce size / seek confirmation.")
+        if s["adx14"] < 20: bullets_short.append(f"{key_tf} ADX<20: trend is **weak**; reduce size / seek confirmation.")
 
-    # confidence nudge
-    if conf == "low":
-        bullets.append("Low ADX: **weak trend** — keep targets closer; breakout confirmation required.")
+    # News risk injection
+    if news_risk == "elevated":
+        bullets_long.append("**News risk elevated** (last 24h): favor tight risk / partial size.")
+        bullets_short.append("**News risk elevated** (last 24h): favor tight risk / partial size.")
 
-    st.subheader("Narrative & decision")
+    # Position management if already in
+    if agg["label"] == "Trend ↑":
+        bullets_manage.append("If **already LONG**: trail below **EMA50 (1h)** / last higher-low; take partials into prior highs.")
+        bullets_manage.append("If **already SHORT**: avoid adding unless daily closes **below EMA200**; consider de-risk on strength.")
+    elif agg["label"] == "Trend ↓":
+        bullets_manage.append("If **already SHORT**: trail above **EMA50 (1h)** / last lower-high; take partials into prior lows.")
+        bullets_manage.append("If **already LONG**: avoid adding unless daily reclaims **EMA200**; consider de-risk on weakness.")
+    else:
+        bullets_manage.append("If in positions during **sideways**: reduce size, use range edges for adds/trim; avoid breakouts without follow-through.")
+
+    return bullets_long, bullets_short, bullets_manage
+
+bl, bs, bm = narrative_playbook(agg, signals, funding_level, funding_side, news_risk)
+
+with st.container():
+    st.subheader("Narrative & decision (multi-TF synthesis)")
     st.markdown(
         f"""
-- **Regime:** **{label}** (confidence: *{conf}*). Price vs EMA200: **{sig['price_vs_ema200']}**, EMA20≷50: **{sig['ema20_cross_50']}**, MACD cross: **{sig['macd_cross']}**.
-- **Funding tilt:** **{funding_str}** — *{funding_level}*, **{funding_side}**.
-- **Playbook:**  
-  {"  \n".join([f"- {b}" for b in bullets])}
-        """.strip()
+**Aggregate Regime:** **{agg['label']}** (confidence: *{agg['conf']}*) · TF votes — ↑:{agg['ups']} / ↓:{agg['downs']} / ↔:{agg['sides']}  
+**Funding tilt:** **{funding_str}** — *{funding_level}*, **{funding_side}** · **News risk:** *{news_risk}*
+"""
     )
+    cL, cS, cM = st.columns(3)
+    cL.markdown("**If considering LONG:**\n\n" + "\n".join([f"- {x}" for x in bl]) if bl else "- n/a")
+    cS.markdown("**If considering SHORT:**\n\n" + "\n".join([f"- {x}" for x in bs]) if bs else "- n/a")
+    cM.markdown("**If already IN (mgmt):**\n\n" + "\n".join([f"- {x}" for x in bm]) if bm else "- n/a")
 
 # ======== SIGNAL MATRIX (multi-TF) ========
 def tf_row(tframe):
-    df2, _src2 = get_klines_df(symbol, tframe, limit=400)
-    df2 = drop_unclosed(df2, tframe)
-    s2 = trend_flags(df2)
+    df2, _src2 = tf_data[tframe]
+    s2 = signals[tframe]
     score, conf2, lab2 = regime_score(s2)
     return {
         "tf": tframe, "close": df2["close"].iloc[-1],
@@ -378,44 +492,44 @@ def color_yesno(val, yes="✓", no="×"):
 st.subheader("Signal matrix (multi-TF)")
 st.dataframe(mat.style.applymap(lambda v: color_yesno(v)).format({"close":"{:.2f}","adx":"{:.1f}"}), use_container_width=True)
 
-with st.expander("What this means (legend)", expanded=False):
+with st.expander("Legend", expanded=False):
     st.markdown(
         """
-- **ema200_dir (↑/↓)** — price above/below EMA200 (structural bias).
-- **ema20>50 (✓/×)** — short-term trend aligned with mid-term.
-- **macd (✓/×)** — MACD line above/below signal (momentum bias).
-- **ADX** — trend strength (≈ **<20**: weak, **20–25**: building, **>25**: trending).
-- **label/score** — quick aggregation into Trend ↑ / Sideways / Trend ↓.
+- **ema200_dir (↑/↓)** — price above/below EMA200 (structural bias).  
+- **ema20>50 (✓/×)** — short-term trend aligned with mid-term.  
+- **macd (✓/×)** — MACD line above/below signal (momentum bias).  
+- **ADX** — trend strength (≈ **<20** weak, **20–25** building, **>25** trending).  
+- **label/score** — aggregation into Trend ↑ / Sideways / Trend ↓.
         """.strip()
     )
 
-# ======== PRICE CHART ========
+# ======== PRICE CHART (only uses chart_tf) ========
 with st.expander("Chart", expanded=True):
-    s = df.set_index("ts")["close"]
+    df_chart, _ = tf_data[chart_tf]
+    s = df_chart.set_index("ts")["close"]
     ema20, ema50, ema200 = ema(s,20), ema(s,50), ema(s,200)
     if not PLOTLY:
         st.info("Plotly not installed — simple line fallback.")
         st.line_chart(s, use_container_width=True)
     else:
         fig = go.Figure()
-        fig.add_trace(go.Candlestick(x=df["ts"], open=df["open"], high=df["high"], low=df["low"], close=df["close"],
-                                     name="OHLC", opacity=0.8))
-        fig.add_trace(go.Scatter(x=df["ts"], y=ema20,  name="EMA20",  line=dict(width=1.5)))
-        fig.add_trace(go.Scatter(x=df["ts"], y=ema50,  name="EMA50",  line=dict(width=1.5)))
-        fig.add_trace(go.Scatter(x=df["ts"], y=ema200, name="EMA200", line=dict(width=1.5)))
+        fig.add_trace(go.Candlestick(x=df_chart["ts"], open=df_chart["open"], high=df_chart["high"],
+                                     low=df_chart["low"], close=df_chart["close"], name="OHLC", opacity=0.8))
+        fig.add_trace(go.Scatter(x=df_chart["ts"], y=ema20,  name="EMA20",  line=dict(width=1.5)))
+        fig.add_trace(go.Scatter(x=df_chart["ts"], y=ema50,  name="EMA50",  line=dict(width=1.5)))
+        fig.add_trace(go.Scatter(x=df_chart["ts"], y=ema200, name="EMA200", line=dict(width=1.5)))
         for n in sorted(set(int(x) for x in extra_emas if isinstance(x,(int,float)))):
             try:
-                fig.add_trace(go.Scatter(x=df["ts"], y=ema(s, n), name=f"EMA{n}", line=dict(width=1)))
+                fig.add_trace(go.Scatter(x=df_chart["ts"], y=ema(s, n), name=f"EMA{n}", line=dict(width=1)))
             except Exception:
                 pass
         fig.update_layout(height=520, margin=dict(l=10,r=10,t=30,b=10), xaxis_rangeslider_visible=False)
         st.plotly_chart(fig, use_container_width=True)
 
-# ======== FUNDING & OI ========
+# ======== FUNDING & OI PANELS ========
 with st.expander("Funding & Open Interest (Futures context)"):
     fcol, ocol = st.columns(2)
     try:
-        fdf, fsrc = fetch_funding(symbol, limit=48)
         if isinstance(fdf, pd.DataFrame) and not fdf.empty:
             last_f = fdf["fundingRate"].iloc[-1]*100
             fcol.metric(f"Last funding ({fsrc})", f"{last_f:.4f}% / 8h")
@@ -426,7 +540,6 @@ with st.expander("Funding & Open Interest (Futures context)"):
         fcol.warning(f"Funding error: {e}")
 
     try:
-        odf, osrc = fetch_open_interest(symbol)
         if isinstance(odf, pd.DataFrame) and not odf.empty:
             ocol.metric(f"Open interest ({osrc})", f"{float(odf['oi'].iloc[-1]):,.0f}")
         else:
@@ -434,7 +547,16 @@ with st.expander("Funding & Open Interest (Futures context)"):
     except Exception as e:
         ocol.warning(f"OI error: {e}")
 
-# ======== report.json table (hidden) ========
+# ======== NEWS (last 24h) ========
+with st.expander("News (last 24h)", expanded=True if news_items else False):
+    if news_items:
+        for n in news_items:
+            ts = n["ts"].strftime("%Y-%m-%d %H:%M UTC")
+            st.markdown(f"- [{n['title']}]({n['link']})  —  *{ts}*")
+    else:
+        st.info("No fresh Bitcoin headlines found in the last 24h.")
+
+# ======== report.json table (debug) ========
 payload = payload or {}
 if payload:
     with st.expander("report.json — raw & pivot (debug)", expanded=False):
