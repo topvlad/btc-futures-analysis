@@ -1,5 +1,5 @@
-# streamlit_app.py — v1.9
-# BTC dashboard: matrix-first layout, per-TF RV20, adaptive confidence, auto Plan A/B with chart overlays, FR/OI context, 24h news
+# streamlit_app.py — v1.9.1
+# BTC dashboard: matrix-first layout, per-TF RV20, adaptive confidence, auto Plan A/B with chart overlays (fixed)
 import os, json, math, time, re, requests, pandas as pd, numpy as np
 import streamlit as st
 from datetime import datetime, timezone, timedelta
@@ -30,7 +30,6 @@ NEWS_FEEDS = [
 ]
 NEWS_LOOKBACK_HOURS = 24
 
-# Layout
 st.set_page_config(page_title="BTC — Regime, Signals & Futures Context", layout="wide")
 
 # ========= SIDEBAR =========
@@ -85,7 +84,6 @@ def fetch_report(url: str):
 # ========= Funding & OI =========
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_funding(symbol: str, limit: int = 48):
-    # Binance
     try:
         base = f"{FAPI_BASES[0]}/fapi/v1/fundingRate"
         data = http_json(base, params={"symbol": symbol, "limit": min(1000,limit)}, allow_worker=bool(cf_worker))
@@ -114,7 +112,6 @@ def fetch_funding(symbol: str, limit: int = 48):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_open_interest(symbol: str):
-    # Binance snapshot
     try:
         j = http_json(f"{FAPI_BASES[0]}/fapi/v1/openInterest", params={"symbol": symbol}, allow_worker=bool(cf_worker))
         if isinstance(j, dict) and "openInterest" in j:
@@ -123,7 +120,6 @@ def fetch_open_interest(symbol: str):
             return pd.DataFrame({"ts":[ts], "oi":[val]}), "binance"
     except Exception:
         pass
-    # OKX snapshot
     try:
         uly = "BTC-USDT" if symbol.endswith("USDT") else "BTC-USDC"
         j = http_json("https://www.okx.com/api/v5/public/open-interest", params={"instType":"SWAP","uly":uly}, timeout=8)
@@ -135,7 +131,7 @@ def fetch_open_interest(symbol: str):
     except Exception:
         return None, "none"
 
-# ========= Spot klines (Binance→OKX→Coinbase) =========
+# ========= Spot klines (providers) =========
 def _to_df_binance(raw):
     cols = ["openTime","open","high","low","close","volume","closeTime","qav","numTrades","takerBase","takerQuote","ignore"]
     df = pd.DataFrame(raw, columns=cols)
@@ -226,7 +222,6 @@ def drop_unclosed(df, interval):
     return out if not out.empty else df
 
 def realized_vol_series(s, win=20):
-    # annualized % volatility based on returns stdev over 'win' bars
     ret = s.pct_change().dropna()
     stdev = ret.rolling(win).std()
     if len(s) >= 2:
@@ -256,7 +251,6 @@ def trend_flags(df):
     }
 
 def regime_score(sig):
-    # Confidence from ADX with stricter bands to avoid "always high"
     adx = sig.get("adx14",0)
     conf = "high" if adx >= 28 else ("medium" if adx >= 22 else "low")
     score = (1 if sig["price_vs_ema200"]=="above" else -1) + (1 if sig["ema20_cross_50"]=="bull" else -1) + (1 if sig["macd_cross"]=="bull" else -1)
@@ -281,7 +275,7 @@ def kpretty(x):
     try: return f"{x:,.2f}"
     except Exception: return str(x)
 
-# ========= CORE LOAD: ALL TFs =========
+# ========= CORE LOAD =========
 @st.cache_data(ttl=60, show_spinner=False)
 def get_all_tf_data(symbol: str, tfs: list[str], limit_each: int = 1000):
     out = {}
@@ -296,17 +290,16 @@ try:
 except Exception as e:
     st.error(f"Klines failed: {e}"); st.stop()
 
-# We’ll use 1h for the chart & plans
+# Use 1h for chart & plan
 df_1h, src_chart = tf_data["1h"]
 last_ts = df_1h["ts"].iloc[-1]; last_close = float(df_1h["close"].iloc[-1])
 st.caption(f"Prices: **{src_chart}**  ·  Worker: {'ON' if cf_worker else 'OFF'}")
 
-# ========= SIGNALS (per TF) & aggregate =========
+# ========= SIGNALS & aggregate =========
 signals = {tf: trend_flags(tf_data[tf][0]) for tf in TFS}
 
 def aggregate_regime(signals: dict):
-    ups = downs = sides = 0
-    strong = 0
+    ups = downs = sides = 0; strong = 0
     for tf, s in signals.items():
         sc, conf, lab = regime_score(s)
         if conf in ("medium","high"): strong += 1
@@ -319,25 +312,24 @@ def aggregate_regime(signals: dict):
 
 agg = aggregate_regime(signals)
 
-# ========= TOP METRICS =========
+# Top metrics (1h)
 s_1h = df_1h.set_index("ts")["close"]
 rv20_1h = realized_vol_series(s_1h, 20).iloc[-1] * 100
 rv60_1h = realized_vol_series(s_1h, 60).iloc[-1] * 100
-
 cA, cB, cC, cD = st.columns([1.2,1.2,1.2,1.2])
 cA.metric("Regime (aggregate)", f"{agg['label']}", f"conf: {agg['conf']}")
 cB.metric("Last Close (1h)", kpretty(last_close), last_ts.strftime("%Y-%m-%d %H:%M UTC"))
 cC.metric("RV20% (1h, annualized)", f"{rv20_1h:0.1f}%")
 cD.metric("RV60% (1h, annualized)", f"{rv60_1h:0.1f}%")
 
-# ========= FUNDING & OI =========
+# Funding / OI
 fdf, fsrc = fetch_funding(symbol, limit=48)
 odf, osrc = fetch_open_interest(symbol)
 last_funding = float(fdf["fundingRate"].iloc[-1]) if isinstance(fdf, pd.DataFrame) and not fdf.empty else None
 funding_str, funding_level, funding_side = funding_tilt(last_funding)
 fund_mean_24h = float(fdf["fundingRate"].tail(3).mean()) if isinstance(fdf, pd.DataFrame) and len(fdf) >= 3 else None
 
-# ========= NEWS (24h) =========
+# News (24h)
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_news(feeds: list[str], lookback_hours: int = 24, max_items: int = 8):
     out = []; cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
@@ -371,25 +363,18 @@ def fetch_news(feeds: list[str], lookback_hours: int = 24, max_items: int = 8):
 news_items = fetch_news(NEWS_FEEDS, NEWS_LOOKBACK_HOURS, 8)
 news_risk = "elevated" if news_items and any(re.search(r"(hack|exploit|liquidat|halt|delay|lawsuit|ban|shutdown|outage|security|CPI|rate)", n["title"], flags=re.I) for n in news_items[:5]) else "normal"
 
-# ========= STORY NARRATIVE =========
+# Narrative
 def narrative_story(agg, signals, funding_level, funding_side, fund_mean_24h, news_risk):
     s1h, s4h, sd = signals["1h"], signals["4h"], signals["1d"]
     lines = []
-    # opening
-    if agg["label"] == "Trend ↑":
-        lines.append("**Tone:** buyers have the ball; most frames lean up.")
-    elif agg["label"] == "Trend ↓":
-        lines.append("**Tone:** sellers in control; bounces meet supply.")
-    else:
-        lines.append("**Tone:** balanced — chop until a clean break sticks.")
-    # structure
+    if agg["label"] == "Trend ↑": lines.append("**Tone:** buyers have the ball; most frames lean up.")
+    elif agg["label"] == "Trend ↓": lines.append("**Tone:** sellers in control; bounces meet supply.")
+    else: lines.append("**Tone:** balanced — chop until a clean break sticks.")
     lines.append("**Daily** " + ("above" if sd["price_vs_ema200"]=="above" else "below") + " long trend (EMA200).")
     lines.append("**4h** " + ("aligned (EMA20>EMA50)" if signals["4h"]["ema20_cross_50"]=="bull" else "not aligned (EMA20<EMA50)"))
     lines.append("**1h momentum** " + ("up (MACD>signal)" if s1h["macd_cross"]=="bull" else "down (MACD<signal)"))
-    # stretch
     if s1h["rsi14"] >= 70 or s4h["rsi14"] >= 70: lines.append("RSI is **hot** on intraday → prefer entries after a pause.")
     if s1h["rsi14"] <= 30 or s4h["rsi14"] <= 30: lines.append("RSI is **cold** → avoid chasing breakdowns; wait for a bounce.")
-    # funding
     if funding_level in ("elevated","extreme"):
         lines.append(f"Funding **{funding_level}**: {funding_side.lower()} — better to enter on pullbacks/pops, not chases.")
     if fund_mean_24h is not None:
@@ -401,38 +386,36 @@ def narrative_story(agg, signals, funding_level, funding_side, fund_mean_24h, ne
 
 tale_lines = narrative_story(agg, signals, funding_level, funding_side, fund_mean_24h, news_risk)
 
-# ========= PLAN A / B (levels from 1h data) =========
+# Plans (1h)
 def swing_levels(df, lookback=30):
-    # recent swing high/low over lookback bars
     highs = df["high"].tail(lookback); lows = df["low"].tail(lookback)
     return float(highs.max()), float(lows.min())
 
 def plan_levels(df_1h, regime_up: bool):
-    s = df_1h.set_index("ts")["close"]
+    s = df_1h["close"]
     ema20v, ema50v = float(ema(s,20).iloc[-1]), float(ema(s,50).iloc[-1])
     swing_hi, swing_lo = swing_levels(df_1h, 30)
     if regime_up:
         entry = (ema20v + ema50v)/2.0
-        stop  = min(swing_lo, entry * 0.993)  # ~0.7% below or swing low
+        stop  = min(swing_lo, entry * 0.993)
         risk  = entry - stop
-        t1    = entry + risk                       # 1R
-        t2    = max(entry + 2*risk, swing_hi)      # 2R or recent high
+        t1    = entry + risk
+        t2    = max(entry + 2*risk, swing_hi)
         note  = "Plan A (long): buy dip into EMA20/EMA50 after 1h closes back above; stop below last higher-low; T1=1R, T2=2R/prev high."
-        alt   = "Plan B (flip): if 1h closes below EMA200 and fails to reclaim, look for short on a weak bounce (same risk model)."
+        alt   = "Plan B (flip): if 1h closes below EMA200 and fails to reclaim, look for short on a weak bounce."
     else:
         entry = (ema20v + ema50v)/2.0
-        stop  = max(swing_hi, entry * 1.007)       # ~0.7% above or swing high
+        stop  = max(swing_hi, entry * 1.007)
         risk  = stop - entry
         t1    = entry - risk
         t2    = min(entry - 2*risk, swing_lo)
         note  = "Plan A (short): sell bounce into EMA20/EMA50 after rejection; stop above last lower-high; T1=1R, T2=2R/prev low."
-        alt   = "Plan B (flip): if 1h reclaims EMA200 and holds, prefer longs on pullbacks (same risk model)."
+        alt   = "Plan B (flip): if 1h reclaims EMA200 and holds, prefer longs on pullbacks."
     return {"entry":entry,"stop":stop,"t1":t1,"t2":t2,"note":note,"alt":alt}
 
 regime_is_up = (agg["label"] == "Trend ↑")
-plan = plan_levels(df_1h, regime_is_up)
+plan = plan_levels(df_1h.copy(), regime_is_up)
 
-# ========= Narrative & Plan =========
 st.subheader("Narrative & decision (multi-TF synthesis)")
 st.markdown(
     f"**Aggregate Regime:** **{agg['label']}** (confidence: *{agg['conf']}*) · TF votes — ↑:{agg['ups']} / ↓:{agg['downs']} / ↔:{agg['sides']}  \n"
@@ -441,7 +424,18 @@ st.markdown(
 st.markdown("\n".join([f"- {ln}" for ln in tale_lines]))
 st.markdown(f"**{plan['note']}**  \n*Plan B:* {plan['alt']}")
 
-# ========= SIGNAL MATRIX (centerpiece) =========
+# ========= Matrix =========
+def realized_vol_series(s, win=20):
+    ret = s.pct_change().dropna()
+    stdev = ret.rolling(win).std()
+    if len(s) >= 2:
+        step = int((s.index[-1] - s.index[-2]).total_seconds())
+    else:
+        step = TF_SECONDS["1h"]
+    per_day = int(86400/max(step,1))
+    per_year = max(1, 365*per_day)
+    return stdev * math.sqrt(per_year)
+
 def tf_row(tframe):
     df2, _ = tf_data[tframe]
     s2 = signals[tframe]
@@ -461,7 +455,6 @@ def tf_row(tframe):
 matrix_rows = [tf_row(t) for t in TFS]
 mat = pd.DataFrame(matrix_rows).set_index("tf")
 
-# ---- color helpers ----
 def color_yesno(val, yes="✓", no="×"):
     if val == yes: return "background-color:#d1ffd6"
     if val == no:  return "background-color:#ffd1d1"
@@ -506,36 +499,47 @@ with st.expander("Legend", expanded=False):
 - **ema20>50, macd, rsi>ma5** — alignment of short-term trend, momentum, RSI direction (✓ good, × opposite).  
 - **rsi / rsi_ma5** — RSI(14) and its 5-bar average (green ≤30, red ≥70).  
 - **adx** — trend strength (**high ≥28**, **medium 22–28**, **low <22**).  
-- **rv20%** — annualized realized volatility from last 20 bars of that TF (helps judge how “fast” the tape is).  
-- **recommend** — quick per-TF action: **Buy dips / Sell rips / Range trade**.  
-- **score/label/conf** come from the three alignment checks and ADX bands above.
+- **rv20%** — annualized realized volatility from last 20 bars of that TF.  
+- **recommend** — per-TF action: **Buy dips / Sell rips / Range trade**.  
+- **score/label/conf** derive from alignment checks and ADX bands above.
         """.strip()
     )
 
-# ========= CHART (fixed 1h, with optional plan overlays) =========
+# ========= CHART (1h, fixed & simplified) =========
 with st.expander("Chart (1h)", expanded=True):
     df = df_1h.copy()
-    s = df.set_index("ts")["close"]
-    ema20s, ema50s, ema200s = ema(s,20), ema(s,50), ema(s,200)
+    x_ts = df["ts"]                      # <-- single timestamp axis everywhere
+    close_s = df["close"]
+    ema20s, ema50s, ema200s = ema(close_s,20), ema(close_s,50), ema(close_s,200)
+
     if not PLOTLY:
-        st.info("Plotly not installed — simple line fallback.")
-        st.line_chart(s, use_container_width=True)
+        st.line_chart(close_s.set_axis(x_ts), use_container_width=True)
     else:
         fig = go.Figure()
-        fig.add_trace(go.Candlestick(x=df["ts"], open=df["open"], high=df["high"], low=df["low"], close=df["close"], name="OHLC", opacity=0.85))
-        fig.add_trace(go.Scatter(x=df.index, y=ema20s,  name="EMA20",  line=dict(width=1.5)))
-        fig.add_trace(go.Scatter(x=df.index, y=ema50s,  name="EMA50",  line=dict(width=1.5)))
-        fig.add_trace(go.Scatter(x=df.index, y=ema200s, name="EMA200", line=dict(width=1.5)))
+        fig.add_trace(go.Candlestick(
+            x=x_ts, open=df["open"], high=df["high"], low=df["low"], close=df["close"],
+            name="OHLC", opacity=0.85
+        ))
+        fig.add_trace(go.Scatter(x=x_ts, y=ema20s,  name="EMA20",  line=dict(width=1.5)))
+        fig.add_trace(go.Scatter(x=x_ts, y=ema50s,  name="EMA50",  line=dict(width=1.5)))
+        fig.add_trace(go.Scatter(x=x_ts, y=ema200s, name="EMA200", line=dict(width=1.5)))
         for n in sorted(set(int(x) for x in extra_emas if isinstance(x,(int,float)))):
-            try: fig.add_trace(go.Scatter(x=df.index, y=ema(s,n), name=f"EMA{n}", line=dict(width=1)))
-            except: pass
+            try:
+                fig.add_trace(go.Scatter(x=x_ts, y=ema(close_s, n), name=f"EMA{n}", line=dict(width=1)))
+            except Exception:
+                pass
         if overlay_plan:
-            for y, name, dash in [(plan["entry"],"Entry", "dot"), (plan["stop"],"Stop","dash"), (plan["t1"],"T1","dash"), (plan["t2"],"T2","dash")]:
+            for y, name, dash in [
+                (plan["entry"],"Entry","dot"),
+                (plan["stop"],"Stop","dash"),
+                (plan["t1"],"T1","dash"),
+                (plan["t2"],"T2","dash")
+            ]:
                 fig.add_hline(y=y, line_dash=dash, annotation_text=f"{name}: {y:,.2f}", annotation_position="right")
-        fig.update_layout(height=560, margin=dict(l=10,r=10,t=30,b=10), xaxis_rangeslider_visible=False)
+        fig.update_layout(height=520, margin=dict(l=10,r=10,t=30,b=10), xaxis_rangeslider_visible=False)
         st.plotly_chart(fig, use_container_width=True)
 
-# ========= FUNDING & OI PANELS =========
+# ========= Funding & OI =========
 with st.expander("Funding & Open Interest (Futures context)"):
     fcol, ocol = st.columns(2)
     try:
@@ -559,10 +563,11 @@ with st.expander("Funding & Open Interest (Futures context)"):
     except Exception as e:
         ocol.warning(f"OI error: {e}")
 
-# ========= NEWS (last 24h) =========
+# ========= NEWS =========
 with st.expander("News (last 24h)", expanded=False):
-    if news_items:
-        for n in news_items:
+    items = fetch_news(NEWS_FEEDS, NEWS_LOOKBACK_HOURS, 8)
+    if items:
+        for n in items:
             ts = n["ts"].strftime("%Y-%m-%d %H:%M UTC")
             st.markdown(f"- [{n['title']}]({n['link']})  —  *{ts}*")
     else:
