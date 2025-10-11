@@ -1,5 +1,5 @@
 # streamlit_app.py
-# BTC dashboard with helicopter view, signal matrix, vol, funding & OI
+# BTC dashboard with helicopter view, signal matrix, vol, funding & OI + narrative/decision box
 import os, json, math, time, requests, pandas as pd, numpy as np
 import streamlit as st
 from datetime import datetime, timezone
@@ -29,14 +29,14 @@ FAPI_BASES = [
 # Default your Worker here (editable in UI)
 CF_WORKER_DEFAULT = os.getenv("CF_WORKER_URL", "https://binance-proxy.brokerof-net.workers.dev")
 
-st.set_page_config(page_title="BTC — Regime & Futures Context", layout="wide")
+st.set_page_config(page_title="BTC — Regime, Signals & Futures Context", layout="wide")
 
 # ======== SIDEBAR ========
-st.sidebar.header("Data Sources")
+st.sidebar.header("Data Sources & Options")
 report_url = st.sidebar.text_input("GitHub Pages report.json", value=REPORT_URL_DEFAULT)
 cf_worker = st.sidebar.text_input("Cloudflare Worker (optional)", value=CF_WORKER_DEFAULT,
                                   help="If set, requests proxy via ?u=<upstream> on this worker.")
-extra_emas = st.sidebar.multiselect("Extra EMAs on chart", options=[100, 400, 800], default=[400])
+extra_emas = st.sidebar.multiselect("Extra EMAs", options=[100, 400, 800], default=[400])
 auto_refresh = st.sidebar.checkbox("Auto-refresh (60s)", value=False)
 if auto_refresh:
     st.experimental_set_query_params(_=int(time.time()))
@@ -103,7 +103,6 @@ def fetch_funding(symbol: str, limit: int = 48):
         arr = j.get("data") or []
         if not arr: return None, "okx_empty"
         df = pd.DataFrame(arr)
-        # OKX returns fundingRate as string, fundingTime as ms
         df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
         df["fundingTime"] = pd.to_datetime(pd.to_numeric(df["fundingTime"], errors="coerce"), unit="ms", utc=True)
         df = df.dropna().sort_values("fundingTime")
@@ -129,7 +128,6 @@ def fetch_open_interest(symbol: str):
         pass
     # OKX fallback (current OI)
     try:
-        # OKX open interest by underlying (contracts)
         uly = "BTC-USDT" if symbol.endswith("USDT") else "BTC-USDC"
         j = http_json("https://www.okx.com/api/v5/public/open-interest",
                       params={"instType":"SWAP","uly":uly}, timeout=8)
@@ -188,17 +186,13 @@ def _coinbase_klines(symbol: str, interval: str, limit: int):
     if not isinstance(data, list) or not data: raise RuntimeError("Coinbase empty")
     return _to_df_coinbase(data), "coinbase"
 
-@st.cache_data(ttl=60, show_spinner=False)
 def get_klines_df(symbol: str, interval: str, limit: int = 500):
-    errs = []
-    try:
-        df, src = _binance_spot_klines(symbol, interval, limit, cf_worker); return df, src
+    errs=[]
+    try: df, src = _binance_spot_klines(symbol, interval, limit, cf_worker); return df, src
     except Exception as e: errs.append(f"binance:{e}")
-    try:
-        df, src = _okx_klines(symbol, interval, limit); return df, src
+    try: df, src = _okx_klines(symbol, interval, limit); return df, src
     except Exception as e: errs.append(f"okx:{e}")
-    try:
-        df, src = _coinbase_klines(symbol, interval, limit); return df, src
+    try: df, src = _coinbase_klines(symbol, interval, limit); return df, src
     except Exception as e: errs.append(f"coinbase:{e}")
     raise RuntimeError("All providers failed → " + " | ".join(errs))
 
@@ -261,39 +255,43 @@ def regime_score(sig):
     label = "Trend ↑" if score >= 2 else ("Sideways" if -1 <= score <= 1 else "Trend ↓")
     return score, conf, label
 
+def funding_tilt(last_rate: float):
+    # rate is per 8h (e.g., 0.0001 = 0.01%)
+    if last_rate is None: return "unknown", "n/a", "n/a"
+    mag = abs(last_rate)
+    level = "neutral" if mag < 0.0001 else ("elevated" if mag < 0.0005 else "extreme")  # 0.01% / 0.05%
+    side = "Longs → Shorts" if last_rate > 0 else ("Shorts → Longs" if last_rate < 0 else "Flat")
+    bps = last_rate * 10000.0
+    return f"{bps:+.2f} bps / 8h", level, side
+
 def kpretty(x):
     try: return f"{x:,.2f}"
     except Exception: return str(x)
 
 # ======== HEADER ========
 st.title("BTC — Regime, Signals & Futures Context")
+
+# ======== COLLAPSED INSTRUMENT (Symbol hidden), TF stays visible ========
+with st.expander("Instrument & options", expanded=False):
+    symbol = st.selectbox("Symbol", SYMBOLS, index=0)
+    st.caption("Tip: leave TF in the top bar; instrument lives here to keep the main view clean.")
+# keep TF visible
+c_tf, c_bars = st.columns([1,1])
+tf = c_tf.selectbox("Timeframe", TFS, index=TFS.index("1h"))
+limit = c_bars.slider("Bars (chart calc)", min_value=200, max_value=1000, value=500, step=100)
+
+# ======== LOAD report.json (only for comparison table later) ========
 payload = None
 if report_url:
     try: payload = fetch_report(report_url)
     except Exception as e: st.warning(f"report.json load failed: {e}")
 
-# ======== CONTROLS ========
-c1, c2, c3 = st.columns([1.2,1.2,1])
-symbol = c1.selectbox("Symbol", SYMBOLS, index=0)
-tf = c2.selectbox("Timeframe", TFS, index=TFS.index("1h"))
-limit = c3.slider("Bars (chart calc)", min_value=200, max_value=1000, value=500, step=100)
-
 # ======== KLINES (multi-provider) ========
 try:
-    def get_klines_df(symbol: str, interval: str, limit: int = 500):
-        errs=[]
-        try: df, src = _binance_spot_klines(symbol, interval, limit, cf_worker); return df, src
-        except Exception as e: errs.append(f"binance:{e}")
-        try: df, src = _okx_klines(symbol, interval, limit); return df, src
-        except Exception as e: errs.append(f"okx:{e}")
-        try: df, src = _coinbase_klines(symbol, interval, limit); return df, src
-        except Exception as e: errs.append(f"coinbase:{e}")
-        raise RuntimeError("All providers failed → " + " | ".join(errs))
-
     df, src = get_klines_df(symbol, tf, limit=limit+5)
     df = drop_unclosed(df, tf)
     last_ts = df["ts"].iloc[-1]; last_close = float(df["close"].iloc[-1])
-    st.caption(f"Prices source: **{src}**  ·  Worker: {'ON' if cf_worker else 'OFF'}")
+    st.caption(f"Prices: **{src}**  ·  Worker: {'ON' if cf_worker else 'OFF'}")
 except Exception as e:
     st.error(f"Klines failed: {e}"); st.stop()
 
@@ -308,6 +306,54 @@ cA.metric("Regime", f"{label}", f"conf: {conf}")
 cB.metric("Last Close", kpretty(last_close), last_ts.strftime("%Y-%m-%d %H:%M UTC"))
 cC.metric("Realized Vol (20)", f"{rv20*100:0.1f}%")
 cD.metric("Realized Vol (60)", f"{rv60*100:0.1f}%")
+
+# ======== NARRATIVE & DECISION (concise) ========
+with st.container():
+    # funding / OI
+    fdf, fsrc = fetch_funding(symbol, limit=48)
+    odf, osrc = fetch_open_interest(symbol)
+    last_funding = None
+    if isinstance(fdf, pd.DataFrame) and not fdf.empty:
+        last_funding = float(fdf["fundingRate"].iloc[-1])
+    funding_str, funding_level, funding_side = funding_tilt(last_funding)
+
+    bullets = []
+    # core regime logic
+    if label == "Trend ↑" and conf in ("medium","high") and sig["price_vs_ema200"]=="above" and sig["ema20_cross_50"]=="bull":
+        bullets.append("Bias: **pro-trend long on pullbacks** to EMA20/EMA50; invalidate on close below EMA50.")
+    elif label == "Trend ↓" and conf in ("medium","high") and sig["price_vs_ema200"]=="below":
+        bullets.append("Bias: **pro-trend short on bounces** to EMA20/EMA50; invalidate on close above EMA50.")
+    else:
+        bullets.append("Bias: **range/mean-revert**; fade extremes near prior swing/EMA bands; wait for alignment.")
+
+    # momentum & stretch
+    if sig["rsi14"] >= 70:
+        bullets.append("RSI>70: **stretched** — prefer **buy dips** only, avoid chasing highs.")
+    if sig["rsi14"] <= 30:
+        bullets.append("RSI<30: **stretched** — prefer **sell rips** only, avoid chasing lows.")
+
+    # funding guidance
+    if funding_level == "extreme":
+        if last_funding and last_funding > 0:
+            bullets.append("Funding **very positive** (longs paying): late-long risk ↑; prefer **pullbacks** or wait for cooling.")
+        elif last_funding and last_funding < 0:
+            bullets.append("Funding **very negative** (shorts paying): **squeeze risk** ↑ on upside breaks; size cautiously.")
+    elif funding_level == "elevated":
+        bullets.append("Funding **elevated**: trend ok but watch for **overcrowding** on the dominant side.")
+
+    # confidence nudge
+    if conf == "low":
+        bullets.append("Low ADX: **weak trend** — keep targets closer; breakout confirmation required.")
+
+    st.subheader("Narrative & decision")
+    st.markdown(
+        f"""
+- **Regime:** **{label}** (confidence: *{conf}*). Price vs EMA200: **{sig['price_vs_ema200']}**, EMA20≷50: **{sig['ema20_cross_50']}**, MACD cross: **{sig['macd_cross']}**.
+- **Funding tilt:** **{funding_str}** — *{funding_level}*, **{funding_side}**.
+- **Playbook:**  
+  {"  \n".join([f"- {b}" for b in bullets])}
+        """.strip()
+    )
 
 # ======== SIGNAL MATRIX (multi-TF) ========
 def tf_row(tframe):
@@ -332,6 +378,17 @@ def color_yesno(val, yes="✓", no="×"):
 st.subheader("Signal matrix (multi-TF)")
 st.dataframe(mat.style.applymap(lambda v: color_yesno(v)).format({"close":"{:.2f}","adx":"{:.1f}"}), use_container_width=True)
 
+with st.expander("What this means (legend)", expanded=False):
+    st.markdown(
+        """
+- **ema200_dir (↑/↓)** — price above/below EMA200 (structural bias).
+- **ema20>50 (✓/×)** — short-term trend aligned with mid-term.
+- **macd (✓/×)** — MACD line above/below signal (momentum bias).
+- **ADX** — trend strength (≈ **<20**: weak, **20–25**: building, **>25**: trending).
+- **label/score** — quick aggregation into Trend ↑ / Sideways / Trend ↓.
+        """.strip()
+    )
+
 # ======== PRICE CHART ========
 with st.expander("Chart", expanded=True):
     s = df.set_index("ts")["close"]
@@ -341,11 +398,11 @@ with st.expander("Chart", expanded=True):
         st.line_chart(s, use_container_width=True)
     else:
         fig = go.Figure()
-        fig.add_trace(go.Candlestick(x=df["ts"], open=df["open"], high=df["high"], low=df["low"], close=df["close"], name="OHLC", opacity=0.8))
+        fig.add_trace(go.Candlestick(x=df["ts"], open=df["open"], high=df["high"], low=df["low"], close=df["close"],
+                                     name="OHLC", opacity=0.8))
         fig.add_trace(go.Scatter(x=df["ts"], y=ema20,  name="EMA20",  line=dict(width=1.5)))
         fig.add_trace(go.Scatter(x=df["ts"], y=ema50,  name="EMA50",  line=dict(width=1.5)))
         fig.add_trace(go.Scatter(x=df["ts"], y=ema200, name="EMA200", line=dict(width=1.5)))
-        # Extra EMAs
         for n in sorted(set(int(x) for x in extra_emas if isinstance(x,(int,float)))):
             try:
                 fig.add_trace(go.Scatter(x=df["ts"], y=ema(s, n), name=f"EMA{n}", line=dict(width=1)))
@@ -377,11 +434,12 @@ with st.expander("Funding & Open Interest (Futures context)"):
     except Exception as e:
         ocol.warning(f"OI error: {e}")
 
-# ======== report.json table ========
+# ======== report.json table (hidden) ========
+payload = payload or {}
 if payload:
-    if payload.get("stale"): st.warning("report.json is **STALE**; charts use live klines.")
-    rows = payload.get("data", []); dfj = pd.json_normalize(rows)
-    with st.expander("report.json — raw & pivot"):
+    with st.expander("report.json — raw & pivot (debug)", expanded=False):
+        if payload.get("stale"): st.warning("report.json is **STALE**; charts use live klines.")
+        rows = payload.get("data", []); dfj = pd.json_normalize(rows)
         if not dfj.empty:
             st.dataframe(dfj, use_container_width=True)
             ok = dfj[dfj["error"].isna()] if "error" in dfj.columns else dfj
