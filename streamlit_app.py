@@ -10,7 +10,6 @@ import numpy as np
 
 import streamlit as st
 from datetime import datetime, timezone, timedelta
-from functools import lru_cache
 from urllib.parse import quote
 
 try:
@@ -35,8 +34,7 @@ report_url = st.sidebar.text_input("GitHub Pages report.json", value=REPORT_URL_
 cf_worker = st.sidebar.text_input("Cloudflare Worker (optional)", help="If set, requests proxy via ?u=<upstream> on this worker.")
 auto_refresh = st.sidebar.checkbox("Auto-refresh (60s)", value=False)
 if auto_refresh:
-    st_autorefresh = st.experimental_memo.clear  # noop alias
-    st.experimental_rerun  # will rerun after scripts; Streamlit Cloud uses built-in timer below
+    st.experimental_set_query_params(_=int(time.time()))  # light "tick" to trigger reruns
 st.sidebar.caption("Spot klines → fast charts; report.json → backup & comparison.")
 
 # ======== UTILS ========
@@ -59,7 +57,8 @@ def http_json(url: str, params=None, timeout=8, allow_worker=False):
             r = requests.get(base, params=None if label=="WORKER" else p, timeout=timeout)
             if r.status_code != 200: last_e = f"status {r.status_code}"; continue
             ct = (r.headers.get("content-type") or "").lower()
-            if "application/json" not in ct and not base.endswith("/klines"):
+            # some endpoints (klines) may return arrays without explicit JSON header — accept them
+            if "application/json" not in ct and not ("/klines" in base or "/candles" in base):
                 last_e = "non_json"; continue
             return r.json()
         except Exception as e:
@@ -76,26 +75,9 @@ def fetch_report(url: str):
         raise RuntimeError("Bad report.json schema.")
     return payload
 
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_spot_klines(symbol: str, interval: str, limit: int = 500):
-    # Try via worker (fast & resilient), else direct
-    for base in SPOT_BASES:
-        full = f"{base}/api/v3/klines"
-        try:
-            if cf_worker:
-                upstream = f"{SPOT_BASES[0]}/api/v3/klines?symbol={symbol}&interval={interval}&limit={min(1000,limit)}"
-                data = http_json(upstream, allow_worker=True)
-            else:
-                data = http_json(full, params={"symbol": symbol, "interval": interval, "limit": min(1000,limit)})
-            if isinstance(data, list) and data:
-                return data
-        except Exception:
-            continue
-    raise RuntimeError("All spot kline bases failed.")
-
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_funding(symbol: str, limit: int = 48):
-    # /fapi/v1/fundingRate — latest records, ascending order
+    # /fapi/v1/fundingRate — latest records
     url = f"{FAPI_BASES[0]}/fapi/v1/fundingRate"
     try:
         if cf_worker:
@@ -120,40 +102,110 @@ def fetch_open_interest(symbol: str):
     except Exception:
         return {}
 
-def to_df_klines(raw):
+# ---------- Converters for different providers ----------
+def _to_df_binance(raw):
     cols = ["openTime","open","high","low","close","volume","closeTime","qav","numTrades","takerBase","takerQuote","ignore"]
     df = pd.DataFrame(raw, columns=cols)
     for c in ("open","high","low","close","volume"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["ts"] = pd.to_datetime(df["closeTime"].astype("int64"), unit="ms", utc=True)
-    return df.dropna().sort_values("ts").reset_index(drop=True)
+    return df[["ts","open","high","low","close"]].dropna().sort_values("ts").reset_index(drop=True)
 
+def _to_df_okx(raw):
+    # OKX: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
+    df = pd.DataFrame(raw, columns=["ts_ms","open","high","low","close","vol","volCcy","volCcyQuote","confirm"])
+    for c in ("open","high","low","close"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["ts"] = pd.to_datetime(df["ts_ms"].astype("int64"), unit="ms", utc=True)
+    return df[["ts","open","high","low","close"]].dropna().sort_values("ts").reset_index(drop=True)
+
+def _to_df_coinbase(raw):
+    # Coinbase Advanced: [ time(sec), low, high, open, close, volume ]
+    df = pd.DataFrame(raw, columns=["t","low","high","open","close","vol"])
+    for c in ("open","high","low","close"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["ts"] = pd.to_datetime(df["t"].astype("int64"), unit="s", utc=True)
+    return df[["ts","open","high","low","close"]].dropna().sort_values("ts").reset_index(drop=True)
+
+# ---------- Providers (Binance → OKX → Coinbase) ----------
+def _binance_spot_klines(symbol: str, interval: str, limit: int, worker_url: str | None):
+    # Try worker first (if provided), then direct bins
+    if worker_url:
+        upstream = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={min(1000,limit)}"
+        data = http_json(upstream, allow_worker=True)
+        return _to_df_binance(data), "binance_spot(worker)"
+    for base in SPOT_BASES:
+        data = http_json(f"{base}/api/v3/klines", params={"symbol": symbol, "interval": interval, "limit": min(1000,limit)}, timeout=8)
+        return _to_df_binance(data), f"binance_spot({base})"
+
+def _okx_klines(symbol: str, interval: str, limit: int):
+    inst = "BTC-USDT" if symbol.endswith("USDT") else "BTC-USDC"
+    bar_map = {"15m":"15m","1h":"1H","4h":"4H","1d":"1D"}
+    bar = bar_map.get(interval, "1H")
+    j = http_json("https://www.okx.com/api/v5/market/candles", params={"instId": inst, "bar": bar, "limit": min(500,limit)}, timeout=8)
+    data = j.get("data") or []
+    if not data: raise RuntimeError("OKX empty")
+    return _to_df_okx(data), "okx"
+
+def _coinbase_klines(symbol: str, interval: str, limit: int):
+    product = "BTC-USD"  # maps both BTCUSDT / BTCUSDC to USD book (good enough for signals)
+    gran = {"15m":900,"1h":3600,"4h":14400,"1d":86400}.get(interval, 3600)
+    data = http_json(f"https://api.exchange.coinbase.com/products/{product}/candles", params={"granularity": gran, "limit": min(300,limit)}, timeout=8)
+    if not isinstance(data, list) or not data: raise RuntimeError("Coinbase empty")
+    return _to_df_coinbase(data), "coinbase"
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_klines_df(symbol: str, interval: str, limit: int = 500):
+    errs = []
+    # 1) Binance spot (worker → direct)
+    try:
+        df, src = _binance_spot_klines(symbol, interval, limit, cf_worker)
+        return df, src
+    except Exception as e:
+        errs.append(f"binance:{e}")
+    # 2) OKX
+    try:
+        df, src = _okx_klines(symbol, interval, limit)
+        return df, src
+    except Exception as e:
+        errs.append(f"okx:{e}")
+    # 3) Coinbase
+    try:
+        df, src = _coinbase_klines(symbol, interval, limit)
+        return df, src
+    except Exception as e:
+        errs.append(f"coinbase:{e}")
+    raise RuntimeError("All providers failed → " + " | ".join(errs))
+
+# ======== INDICATORS & REGIME ========
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
+
 def rsi(s, n=14):
     d = s.diff(); gain = d.clip(lower=0); loss = -d.clip(upper=0)
     rs = gain.rolling(n).mean() / loss.rolling(n).mean()
     return 100 - (100/(1+rs))
+
 def macd(s, fast=12, slow=26, signal=9):
     line = ema(s, fast) - ema(s, slow)
     sig = line.ewm(span=signal, adjust=False).mean()
     return line, sig, line - sig
 
 def adx(df, n=14):
-    # Wilder’s ADX needs high/low/close
     high, low, close = df["high"], df["low"], df["close"]
-    plus_dm  = (high.diff()).where(lambda x: x >  low.diff().abs(), 0.0).clip(lower=0)
-    minus_dm = (low.diff().abs()).where(lambda x: x > high.diff(), 0.0).clip(lower=0)
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
     tr = pd.concat([
         (high - low),
         (high - close.shift()).abs(),
         (low  - close.shift()).abs()
     ], axis=1).max(axis=1)
     tr_n = tr.rolling(n).sum()
-    plus_di  = 100 * (plus_dm.rolling(n).sum() / tr_n)
-    minus_di = 100 * (minus_dm.rolling(n).sum() / tr_n)
+    plus_di  = 100 * (pd.Series(plus_dm, index=df.index).rolling(n).sum() / tr_n)
+    minus_di = 100 * (pd.Series(minus_dm, index=df.index).rolling(n).sum() / tr_n)
     dx = ( (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan) ) * 100
-    adx_val = dx.rolling(n).mean()
-    return adx_val
+    return dx.rolling(n).mean()
 
 def tf_open_of_current(interval: str, now_utc=None):
     now_utc = now_utc or datetime.now(timezone.utc)
@@ -171,7 +223,6 @@ def trend_flags(df):
     s = df["close"]
     ema20 = ema(s, 20); ema50 = ema(s, 50); ema200 = ema(s, 200)
     macd_line, macd_sig, macd_hist = macd(s)
-    # ADX from OHLC
     adx_val = adx(df, 14)
     out = {
         "ema20": float(ema20.iloc[-1]),
@@ -190,17 +241,14 @@ def trend_flags(df):
     return out
 
 def realized_vol(s, win=20):
-    # dailyized (for arbitrary TF): stdev of returns * sqrt(periods_per_year)
     ret = s.pct_change().dropna()
     stdev = ret.rolling(win).std().iloc[-1]
-    # annualization factor: 365d * (24h*3600/TF_SECONDS) if TF < 1d; else 365
     step = int((s.index[-1] - s.index[-2]).total_seconds())
     per_day = int(86400/step) if step else 1
     per_year = max(1, 365*per_day)
     return float(stdev * math.sqrt(per_year))
 
 def regime_score(sig):
-    # +1 each if uptrend feature aligns; -1 if not; ADX>25 boosts confidence
     score = 0
     score += 1 if sig["price_vs_ema200"] == "above" else -1
     score += 1 if sig["ema20_cross_50"] == "bull" else -1
@@ -233,15 +281,15 @@ symbol = c1.selectbox("Symbol", SYMBOLS, index=0)
 tf = c2.selectbox("Timeframe", TFS, index=TFS.index("1h"))
 limit = c3.slider("Bars (chart calc)", min_value=200, max_value=1000, value=500, step=100)
 
-# ======== FETCH FRESH KLINES FOR CHARTS ========
+# ======== FETCH FRESH KLINES FOR CHARTS (with multi-provider fallback) ========
 try:
-    raw = fetch_spot_klines(symbol, tf, limit=limit+5)
-    df = to_df_klines(raw)
+    df, src = get_klines_df(symbol, tf, limit=limit+5)
     df = drop_unclosed(df, tf)
     last_ts = df["ts"].iloc[-1]
     last_close = float(df["close"].iloc[-1])
+    st.caption(f"Data source: **{src}**")
 except Exception as e:
-    st.error(f"Spot klines failed: {e}")
+    st.error(f"Klines failed: {e}")
     st.stop()
 
 # ======== SIGNALS & HELICOPTER VIEW ========
@@ -258,8 +306,8 @@ cD.metric("Realized Vol (60)", f"{rv60*100:0.1f}%")
 
 # ======== SIGNAL MATRIX (multi-TF quick view) ========
 def tf_row(tframe):
-    raw2 = fetch_spot_klines(symbol, tframe, limit=400)
-    df2  = drop_unclosed(to_df_klines(raw2), tframe)
+    df2, _src2 = get_klines_df(symbol, tframe, limit=400)
+    df2 = drop_unclosed(df2, tframe)
     s2   = trend_flags(df2)
     score, conf2, lab2 = regime_score(s2)
     return {
@@ -290,20 +338,20 @@ st.dataframe(
 with st.expander("Chart", expanded=True):
     s = df.set_index("ts")["close"]
     ema20 = ema(s,20); ema50=ema(s,50); ema200=ema(s,200)
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=df["ts"], open=df["open"], high=df["high"], low=df["low"], close=df["close"],
-        name="OHLC", opacity=0.8
-    ))
-    fig.add_trace(go.Scatter(x=df["ts"], y=ema20, name="EMA20", line=dict(width=1.5)))
-    fig.add_trace(go.Scatter(x=df["ts"], y=ema50, name="EMA50", line=dict(width=1.5)))
-    fig.add_trace(go.Scatter(x=df["ts"], y=ema200, name="EMA200", line=dict(width=1.5)))
-    fig.update_layout(height=520, margin=dict(l=10,r=10,t=30,b=10), xaxis_rangeslider_visible=False)
-if not PLOTLY:
-    st.info("Plotly not installed — showing quick line chart fallback.")
-    st.line_chart(df.set_index("ts")["close"], use_container_width=True)
-else:
-    st.plotly_chart(fig, use_container_width=True)
+    if not PLOTLY:
+        st.info("Plotly not installed — showing quick line chart fallback.")
+        st.line_chart(s, use_container_width=True)
+    else:
+        fig = go.Figure()
+        fig.add_trace(go.Candlestick(
+            x=df["ts"], open=df["open"], high=df["high"], low=df["low"], close=df["close"],
+            name="OHLC", opacity=0.8
+        ))
+        fig.add_trace(go.Scatter(x=df["ts"], y=ema20, name="EMA20", line=dict(width=1.5)))
+        fig.add_trace(go.Scatter(x=df["ts"], y=ema50, name="EMA50", line=dict(width=1.5)))
+        fig.add_trace(go.Scatter(x=df["ts"], y=ema200, name="EMA200", line=dict(width=1.5)))
+        fig.update_layout(height=520, margin=dict(l=10,r=10,t=30,b=10), xaxis_rangeslider_visible=False)
+        st.plotly_chart(fig, use_container_width=True)
 
 # ======== FUNDING & OI ========
 with st.expander("Funding & Open Interest (Futures context)"):
