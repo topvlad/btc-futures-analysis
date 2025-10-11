@@ -41,7 +41,13 @@ overlay_plan = st.sidebar.checkbox("Draw Plan A/B on chart (1h)", value=True)
 extra_emas = st.sidebar.multiselect("Extra EMAs (on chart)", options=[100, 400, 800], default=[400])
 auto_refresh = st.sidebar.checkbox("Auto-refresh (60s)", value=False)
 if auto_refresh:
-    st.experimental_set_query_params(_=int(time.time()))
+    # Streamlit ≥1.30: st.query_params is a mutable mapping
+    # Keep value as string to be safe across versions.
+    try:
+        st.query_params["_"] = str(int(time.time()))
+    except Exception:
+        # Older/edge versions: just ignore if not available
+        pass
 st.sidebar.caption("Prices: Binance→OKX→Coinbase. FR/OI: Binance→OKX. Worker, if set, proxies Binance.")
 
 # ========= HTTP helpers =========
