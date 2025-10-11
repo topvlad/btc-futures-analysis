@@ -299,6 +299,10 @@ with st.expander("Chart", expanded=True):
     fig.add_trace(go.Scatter(x=df["ts"], y=ema50, name="EMA50", line=dict(width=1.5)))
     fig.add_trace(go.Scatter(x=df["ts"], y=ema200, name="EMA200", line=dict(width=1.5)))
     fig.update_layout(height=520, margin=dict(l=10,r=10,t=30,b=10), xaxis_rangeslider_visible=False)
+if not PLOTLY:
+    st.info("Plotly not installed — showing quick line chart fallback.")
+    st.line_chart(df.set_index("ts")["close"], use_container_width=True)
+else:
     st.plotly_chart(fig, use_container_width=True)
 
 # ======== FUNDING & OI ========
