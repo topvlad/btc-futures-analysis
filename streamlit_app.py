@@ -7,11 +7,17 @@ import time
 import requests
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
+
 import streamlit as st
 from datetime import datetime, timezone, timedelta
 from functools import lru_cache
 from urllib.parse import quote
+
+try:
+    import plotly.graph_objects as go
+    PLOTLY = True
+except Exception:
+    PLOTLY = False
 
 # ======== CONFIG ========
 REPORT_URL_DEFAULT = "https://topvlad.github.io/btc-futures-analysis/report.json"
