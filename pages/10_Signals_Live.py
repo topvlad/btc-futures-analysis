@@ -1,4 +1,4 @@
-# pages/10_Signals_Live.py — v1.0 (resilient live polling, taker 24h fallback, premium z via deque)
+# pages/10_Signals_Live.py — v1.1
 import time, collections
 from datetime import datetime, timezone
 import numpy as np
@@ -31,8 +31,8 @@ st.markdown("""
 **Setup B (Premium Mean Reversion)** — велика премія → очікуваний відкат.
 
 - ΔOI% — best-effort зміна OI між опитуваннями (snapshot).  
-- Taker ratio — `buySellRatio` або fallback з 24h тикера (не блокується проксі).  
-- Premium z-score — z-оцінка індексу премії в `deque` (без зайвих викликів).
+- Taker ratio — `buySellRatio` або fallback, інакше використовуємо імпульс ціни як проксі.  
+- Premium z-score — z-оцінка індексу премії в deque.
 """)
 st.info("💡 Узгоджуй із головним дашбордом: *Trend ↑* → LONG-пріоритет; *Trend ↓* → SHORT-пріоритет.")
 
@@ -74,10 +74,8 @@ def _load_klines_df(symbol: str, interval: str) -> pd.DataFrame:
     return df
 
 # session state for ΔOI and premium z
-if "last_oi" not in st.session_state:
-    st.session_state.last_oi = None
-if "prem_hist" not in st.session_state:
-    st.session_state.prem_hist = collections.deque(maxlen=int(z_win))
+if "last_oi" not in st.session_state: st.session_state.last_oi = None
+if "prem_hist" not in st.session_state: st.session_state.prem_hist = collections.deque(maxlen=int(z_win))
 
 # ---------------- Signal engines ----------------
 def _try_signal_A() -> None:
@@ -86,38 +84,36 @@ def _try_signal_A() -> None:
     oi_now = fetch_open_interest(symbol)
     if oi_now is not None:
         last = st.session_state.last_oi
-        if last:
-            d_oi = (oi_now - last) / max(last, 1e-9) * 100.0
+        if last: d_oi = (oi_now - last) / max(last, 1e-9) * 100.0
         st.session_state.last_oi = oi_now
 
-    # taker ratio with fallback
+    # taker ratio (with internal fallback in data_sources; may still return None)
     ratio, imb, _ = fetch_taker_longshort_ratio(symbol, _ratio_period(interval), limit=20)
-    if ratio is None:
-        st.info("Waiting for taker ratio (using fallback)…")
-        return
 
-    # small impulse confirmation from last bar
+    # price impulse proxy
     df = _load_klines_df(symbol, interval)
     if df.empty:
-        st.warning("Price feed unavailable (proxy). Degraded mode.")
+        st.warning("Price feed degraded (will retry).")
         return
-    r = float(df["ret"].iloc[-1])
+    r1 = float(df["ret"].iloc[-1])
+    r3 = float(df["ret"].tail(3).sum())
+    # if taker unavailable, synthesize a proxy from price impulse
+    ratio_eff = ratio if ratio is not None else (1.0 + max(0.0, r3*100))  # mild >1 on up-impulse
 
     note = " · ".join([
         (f"ΔOI {d_oi:+.2f}%" if d_oi is not None else "ΔOI n/a"),
-        f"taker ratio {ratio:.2f}",
-        f"1-bar ret {r:+.4f}",
+        f"taker ratio {ratio_eff:.2f}" + (" (proxy)" if ratio is None else ""),
+        f"1-bar ret {r1:+.4f}; 3-bar {r3:+.4f}",
     ])
 
-    if (d_oi is None or d_oi >= oi_min) and ratio >= taker_min and r > 0:
-        _render_card("LONG", (0.0 if d_oi is None else d_oi), ratio, note)
-    elif (d_oi is None or d_oi >= oi_min) and ratio <= (1.0 / taker_min) and r < 0:
-        _render_card("SHORT", (0.0 if d_oi is None else d_oi), ratio, note)
+    if (d_oi is None or d_oi >= oi_min) and ratio_eff >= taker_min and r1 > 0:
+        _render_card("LONG", (0.0 if d_oi is None else d_oi), ratio_eff, note)
+    elif (d_oi is None or d_oi >= oi_min) and ratio_eff <= (1.0 / taker_min) and r1 < 0:
+        _render_card("SHORT", (0.0 if d_oi is None else d_oi), ratio_eff, note)
     else:
         st.write("…no signal yet — waiting for conditions to trigger ⚙️")
 
 def _try_signal_B() -> None:
-    # accumulate premium into deque → stable z
     prem, _ = fetch_premium_index_klines(symbol, interval)
     if prem is not None:
         st.session_state.prem_hist.append(float(prem))
@@ -129,7 +125,6 @@ def _try_signal_B() -> None:
     s = np.array(st.session_state.prem_hist, dtype=float)
     z = (s[-1] - s.mean()) / (s.std() + 1e-12)
 
-    # simple direction filter via short MA
     df = _load_klines_df(symbol, interval)
     ma = df["close"].rolling(10).mean().iloc[-1] if not df.empty else None
     px = df["close"].iloc[-1] if not df.empty else None
@@ -146,7 +141,7 @@ def _try_signal_B() -> None:
 hdr = st.empty()
 st.markdown("### ⏱ Realtime feed (auto refresh ~10s)")
 
-for _ in range(24):  # ~4 minutes, lightweight
+for _ in range(24):  # ~4 minutes
     with hdr.container():
         dfv = _load_klines_df(symbol, interval)
         if not dfv.empty:
@@ -154,9 +149,5 @@ for _ in range(24):  # ~4 minutes, lightweight
         else:
             st.warning("Price feed degraded (will retry).")
 
-    if setup.startswith("A"):
-        _try_signal_A()
-    else:
-        _try_signal_B()
-
+    (_try_signal_A if setup.startswith("A") else _try_signal_B)()
     time.sleep(10)
