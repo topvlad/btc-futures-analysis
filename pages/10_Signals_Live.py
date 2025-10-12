@@ -45,11 +45,12 @@ def _ratio_period(tf: str) -> str:
 @st.cache_data(ttl=45, show_spinner=False)
 def load_klines_df(symbol: str, interval: str) -> pd.DataFrame:
     rows = fetch_klines(symbol, interval, limit=240)
+    if not rows:
+        return pd.DataFrame()  # порожньо → вище покажемо degraded
     df = pd.DataFrame(rows)
-    if df.empty:
-        raise RuntimeError("Empty klines")
     df["ret"] = df["close"].pct_change()
     return df
+
 
 # --------------- Helpers ---------------
 def render_card(kind: str, v1: float, v2: float, note: str = ""):
@@ -80,25 +81,23 @@ if "prem_hist" not in st.session_state:
 def try_signal_A() -> None:
     # ΔOI% (best-effort snapshot) + taker ratio + 1-bar impulse
     d_oi = None
-    try:
-        oi_now = fetch_open_interest(symbol)
-        if st.session_state.last_oi:
-            d_oi = (oi_now - st.session_state.last_oi) / max(st.session_state.last_oi, 1e-9) * 100.0
-        st.session_state.last_oi = oi_now
-    except Exception:
-        pass
+    oi_now = fetch_open_interest(symbol)
+    if oi_now is not None:
+        last = st.session_state.get("last_oi")
+        if last:
+            d_oi = (oi_now - last) / max(last, 1e-9) * 100.0
+        st.session_state["last_oi"] = oi_now
 
     ratio, imb, _ = fetch_taker_longshort_ratio(symbol, _ratio_period(interval), limit=20)
     if ratio is None:
-        st.info("Waiting for taker ratio…")
+        st.info("Waiting for taker ratio (proxy busy)…")
         return
 
-    try:
-        df = load_klines_df(symbol, interval)
-        r = float(df["ret"].iloc[-1])
-    except Exception as e:
-        st.warning(f"Price feed degraded (retrying): {e}")
-        r = 0.0
+    df = load_klines_df(symbol, interval)
+    if df.empty:
+        st.warning("Price feed unavailable right now (proxy). Degraded mode.")
+        return
+    r = float(df["ret"].iloc[-1])
 
     note_bits = []
     if d_oi is not None:
@@ -114,34 +113,6 @@ def try_signal_A() -> None:
     else:
         st.write("…no signal yet — waiting for conditions to trigger ⚙️")
 
-def try_signal_B() -> None:
-    # накопичуємо premium у deque → стабільний z-score
-    val, _ts = fetch_premium_index_klines(symbol, interval)
-    if val is not None:
-        st.session_state.prem_hist.append(float(val))
-
-    if len(st.session_state.prem_hist) < max(10, int(z_win*0.5)):
-        st.info("Collecting premium samples…")
-        return
-
-    s = np.array(st.session_state.prem_hist, dtype=float)
-    z = (s[-1] - s.mean()) / (s.std() + 1e-12)
-
-    # простий фільтр напрямку через ковзну середню ціни
-    try:
-        df = load_klines_df(symbol, interval)
-        ma = df["close"].rolling(10).mean().iloc[-1]
-        px = df["close"].iloc[-1]
-    except Exception:
-        ma, px = None, None
-
-    note = f"premium z={z:.2f} over {len(s)} samples"
-    if z >= prem_z and (ma is None or px > ma):
-        render_card("SHORT", z, (px or 0.0), note)
-    elif z <= -prem_z and (ma is None or px < ma):
-        render_card("LONG", -z, (px or 0.0), note)
-    else:
-        st.write("…no signal yet — premium within normal band ⚙️")
 
 # --------------- Header chart + live loop ---------------
 hdr = st.empty()
