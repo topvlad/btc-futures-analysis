@@ -19,11 +19,24 @@ st.set_page_config(page_title="⚡ LIVE Signals", layout="wide")
 # ---------------- Sidebar parameters ----------------
 st.sidebar.header("Parameters (quick)")
 colA, colB = st.sidebar.columns(2)
-oi_min = colA.number_input("ΔOI% min (A)", min_value=0.05, max_value=5.0, value=0.10, step=0.05)
-taker_min = colB.number_input("Taker ratio min (A)", min_value=1.00, max_value=3.00, value=1.10, step=0.05)
+oi_min = colA.number_input(
+    "ΔOI% min (A)", 0.05, 5.0, 0.10, 0.05,
+    help="Best-effort open-interest change between polls (snapshot). Used as an impulse filter in Setup A."
+)
+taker_min = colB.number_input(
+    "Taker ratio min (A)", 1.00, 3.00, 1.10, 0.05,
+    help="Aggressor balance (buy/sell takers). Require ≥ this for LONGs (≤ 1/x for SHORTs)."
+)
 colC, colD = st.sidebar.columns(2)
-prem_z = colC.number_input("Premium z-threshold (B)", min_value=0.5, max_value=6.0, value=2.0, step=0.1)
-z_win = colD.number_input("Z lookback (bars)", min_value=10, max_value=200, value=60, step=5)
+prem_z = colC.number_input(
+    "Premium z-threshold (B)", 0.5, 6.0, 2.0, 0.1,
+    help="Z-score threshold of futures premium vs its recent mean. |z| above this → mean-reversion signal."
+)
+z_win = colD.number_input(
+    "Z lookback (bars)", 10, 200, 60, 5,
+    help="Bars used to compute rolling mean & std for premium z-score."
+)
+
 
 # ---------------- Legend / guide ----------------
 st.title("⚡ LIVE Signals (1–5–15m)")
