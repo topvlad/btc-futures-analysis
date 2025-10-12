@@ -1,4 +1,4 @@
-# pages/10_Signals_Live.py — v1.1
+# pages/10_Signals_Live.py — v1.2
 import time, collections
 from datetime import datetime, timezone
 import numpy as np
@@ -10,6 +10,8 @@ from core.data_sources import (
     fetch_open_interest,
     fetch_taker_longshort_ratio,
     fetch_premium_index_klines,
+    fetch_premium_series,
+    fetch_synthetic_premium,
 )
 
 st.set_page_config(page_title="⚡ LIVE Signals", layout="wide")
@@ -31,8 +33,8 @@ st.markdown("""
 **Setup B (Premium Mean Reversion)** — велика премія → очікуваний відкат.
 
 - ΔOI% — best-effort зміна OI між опитуваннями (snapshot).  
-- Taker ratio — `buySellRatio` або fallback, інакше використовуємо імпульс ціни як проксі.  
-- Premium z-score — z-оцінка індексу премії в deque.
+- Taker ratio — `buySellRatio` або проксі з 24h тикера.  
+- Premium z-score — seed із історії; якщо endpoint недоступний — синтетична премія (futures–spot).
 """)
 st.info("💡 Узгоджуй із головним дашбордом: *Trend ↑* → LONG-пріоритет; *Trend ↓* → SHORT-пріоритет.")
 
@@ -41,7 +43,6 @@ symbol = st.selectbox("Symbol", ["BTCUSDT", "ETHUSDT"], index=0)
 interval = st.selectbox("Interval", ["1m", "5m", "15m"], index=0)
 setup = st.radio("Setup", ["A: Impulse + Participation", "B: Premium Mean Reversion"], horizontal=True)
 
-# ---------------- Utils ----------------
 def _ratio_period(tf: str) -> str:
     return {"1m":"5m","5m":"5m","15m":"15m"}.get(tf, "5m")
 
@@ -74,12 +75,25 @@ def _load_klines_df(symbol: str, interval: str) -> pd.DataFrame:
     return df
 
 # session state for ΔOI and premium z
-if "last_oi" not in st.session_state: st.session_state.last_oi = None
-if "prem_hist" not in st.session_state: st.session_state.prem_hist = collections.deque(maxlen=int(z_win))
+if "last_oi" not in st.session_state:
+    st.session_state.last_oi = None
+if "prem_hist" not in st.session_state:
+    st.session_state.prem_hist = collections.deque(maxlen=int(z_win))
+    # seed once with historical premium; fallback to synthetic
+    seed = fetch_premium_series(symbol, interval, limit=int(z_win))
+    if seed:
+        for v in seed[-int(z_win):]:
+            st.session_state.prem_hist.append(float(v))
+    else:
+        # synthetic seed: 20 quick samples
+        for _ in range(min(20, int(z_win))):
+            sp = fetch_synthetic_premium(symbol)
+            if sp is not None:
+                st.session_state.prem_hist.append(float(sp))
+            time.sleep(0.02)
 
 # ---------------- Signal engines ----------------
 def _try_signal_A() -> None:
-    # best-effort ΔOI%
     d_oi = None
     oi_now = fetch_open_interest(symbol)
     if oi_now is not None:
@@ -87,18 +101,15 @@ def _try_signal_A() -> None:
         if last: d_oi = (oi_now - last) / max(last, 1e-9) * 100.0
         st.session_state.last_oi = oi_now
 
-    # taker ratio (with internal fallback in data_sources; may still return None)
     ratio, imb, _ = fetch_taker_longshort_ratio(symbol, _ratio_period(interval), limit=20)
 
-    # price impulse proxy
     df = _load_klines_df(symbol, interval)
     if df.empty:
         st.warning("Price feed degraded (will retry).")
         return
     r1 = float(df["ret"].iloc[-1])
     r3 = float(df["ret"].tail(3).sum())
-    # if taker unavailable, synthesize a proxy from price impulse
-    ratio_eff = ratio if ratio is not None else (1.0 + max(0.0, r3*100))  # mild >1 on up-impulse
+    ratio_eff = ratio if ratio is not None else (1.0 + max(0.0, r3*100))
 
     note = " · ".join([
         (f"ΔOI {d_oi:+.2f}%" if d_oi is not None else "ΔOI n/a"),
@@ -115,10 +126,16 @@ def _try_signal_A() -> None:
 
 def _try_signal_B() -> None:
     prem, _ = fetch_premium_index_klines(symbol, interval)
+    used_syn = False
+    if prem is None:
+        sp = fetch_synthetic_premium(symbol)
+        if sp is not None:
+            prem = sp
+            used_syn = True
     if prem is not None:
         st.session_state.prem_hist.append(float(prem))
 
-    if len(st.session_state.prem_hist) < max(10, int(z_win * 0.5)):
+    if len(st.session_state.prem_hist) < 10:
         st.info("Collecting premium samples…")
         return
 
@@ -129,7 +146,7 @@ def _try_signal_B() -> None:
     ma = df["close"].rolling(10).mean().iloc[-1] if not df.empty else None
     px = df["close"].iloc[-1] if not df.empty else None
 
-    note = f"premium z={z:.2f} over {len(s)} samples"
+    note = f"{'synthetic ' if used_syn else ''}premium z={z:.2f} over {len(s)} samples"
     if z >= prem_z and (ma is None or (px and px > ma)):
         _render_card("SHORT", z, (px or 0.0), note)
     elif z <= -prem_z and (ma is None or (px and px < ma)):
@@ -141,7 +158,7 @@ def _try_signal_B() -> None:
 hdr = st.empty()
 st.markdown("### ⏱ Realtime feed (auto refresh ~10s)")
 
-for _ in range(24):  # ~4 minutes
+for _ in range(24):
     with hdr.container():
         dfv = _load_klines_df(symbol, interval)
         if not dfv.empty:
