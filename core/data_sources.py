@@ -1,4 +1,4 @@
-# core/data_sources.py — v0.9 (robust GET, single-proxy, soft returns, multi-exchange klines + taker 24h fallback)
+# core/data_sources.py — v1.0
 import os, time, json, random, asyncio, requests
 from datetime import datetime, timezone
 from urllib.parse import quote
@@ -24,7 +24,7 @@ SPOT_BASES = [
 PROXY_URL = (os.getenv("CF_WORKER_URL") or os.getenv("CF_WORKER_BASE") or "").strip()
 
 DEFAULT_TIMEOUT = 8
-USER_AGENT = "btc-futures-analysis/0.9 (+streamlit)"
+USER_AGENT = "btc-futures-analysis/1.0 (+streamlit)"
 
 # ---------- Helpers ----------
 def _compose_upstream(url: str, params: Optional[dict]) -> str:
@@ -48,14 +48,12 @@ def _proxy_get(upstream_full_url: str, timeout: int = DEFAULT_TIMEOUT):
 def _robust_get(url: str, params: Optional[dict] = None, timeout: int = DEFAULT_TIMEOUT, prefer_proxy: bool = False):
     upstream_full = _compose_upstream(url, params)
 
-    # 1) proxy first (optional)
     if prefer_proxy and PROXY_URL:
         try:
             return _proxy_get(upstream_full, timeout=timeout)
         except Exception:
             pass
 
-    # 2) 2–3 shuffled bases (fapi or api)
     bases = FAPI_BASES.copy() if "fapi.binance.com" in url else SPOT_BASES.copy()
     random.shuffle(bases)
     for base in bases[:3]:
@@ -65,7 +63,6 @@ def _robust_get(url: str, params: Optional[dict] = None, timeout: int = DEFAULT_
         except Exception:
             time.sleep(0.2 + random.random()*0.2)
 
-    # 3) proxy
     if PROXY_URL:
         return _proxy_get(upstream_full, timeout=timeout)
 
@@ -73,21 +70,18 @@ def _robust_get(url: str, params: Optional[dict] = None, timeout: int = DEFAULT_
 
 # ---------- KLInes (soft) ----------
 def fetch_klines(symbol: str, interval: str, limit: int = 240) -> List[dict]:
-    # 1) Futures
     try:
         url = "https://fapi.binance.com/fapi/v1/klines"
         data = _robust_get(url, {"symbol": symbol.upper(), "interval": interval, "limit": limit}, prefer_proxy=True)
         return _klines_to_rows(data)
     except Exception:
         pass
-    # 2) SPOT
     try:
         url = "https://api.binance.com/api/v3/klines"
         data = _robust_get(url, {"symbol": symbol.upper(), "interval": interval, "limit": min(1000,limit)}, prefer_proxy=True)
         return _klines_to_rows(data)
     except Exception:
         pass
-    # 3) OKX spot
     try:
         inst = _okx_inst(symbol); bar = _okx_bar(interval)
         j = _direct_get("https://www.okx.com/api/v5/market/candles", {"instId": inst, "bar": bar, "limit": min(500,limit)})
@@ -99,13 +93,12 @@ def fetch_klines(symbol: str, interval: str, limit: int = 240) -> List[dict]:
         return rows[-limit:] if rows else []
     except Exception:
         pass
-    # 4) Coinbase spot
     try:
         product = "BTC-USD" if symbol.upper().startswith("BTC") else ("ETH-USD" if symbol.upper().startswith("ETH") else "BTC-USD")
         gran = {"1m":60,"5m":300,"15m":900,"30m":1800,"1h":3600}.get(interval,300)
         data = _direct_get(f"https://api.exchange.coinbase.com/products/{product}/candles", {"granularity":gran, "limit":min(300,limit)})
         rows = []
-        for x in data:  # [time, low, high, open, close, volume]
+        for x in data:
             ts = datetime.utcfromtimestamp(int(x[0])).replace(tzinfo=timezone.utc)
             rows.append({"ts": ts, "open": float(x[3]), "high": float(x[2]), "low": float(x[1]), "close": float(x[4]), "volume": float(x[5])})
         rows.sort(key=lambda r: r["ts"])
@@ -148,11 +141,6 @@ def _norm_taker_period(period: str) -> str:
     return mapping.get((period or "5m").lower(), "5m")
 
 def fetch_taker_longshort_ratio(symbol: str, period: str = "5m", limit: int = 30) -> Tuple[Optional[float], Optional[float], Optional[int]]:
-    """
-    Primary: /futures/data/takerlongshortRatio
-    Fallback: /fapi/v1/ticker/24hr → approximate ratio from takerBuyBaseAssetVolume vs total volume.
-    Returns (ratio, imbalance, timestamp_ms) or (None, None, None).
-    """
     # Primary endpoint
     try:
         url = "https://fapi.binance.com/futures/data/takerlongshortRatio"
@@ -169,24 +157,21 @@ def fetch_taker_longshort_ratio(symbol: str, period: str = "5m", limit: int = 30
             return ratio, imb, ts
     except Exception:
         pass
-
-    # Fallback: 24h ticker
+    # Fallback: 24h ticker (approximate)
     try:
         url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
         j = _robust_get(url, {"symbol": symbol.upper()}, prefer_proxy=True)
-        # fields: "volume", "takerBuyBaseAssetVolume"
         vol = float(j.get("volume", "0") or 0.0)
         buy = float(j.get("takerBuyBaseAssetVolume", "0") or 0.0)
         if vol > 0:
             sell = max(vol - buy, 0.0)
-            ratio = (buy / max(sell, 1e-12)) if sell > 0 else 2.0  # if no sells, assume strong buy
+            ratio = (buy / max(sell, 1e-12)) if sell > 0 else 2.0
             denom = (buy + sell) or 1.0
             imb = (buy - sell) / denom
             ts = int(datetime.now(timezone.utc).timestamp() * 1000)
             return ratio, imb, ts
     except Exception:
         pass
-
     return None, None, None
 
 def fetch_premium_index_klines(symbol: str, interval: str = "1m", limit: int = 60) -> Tuple[Optional[float], Optional[int]]:
@@ -201,7 +186,41 @@ def fetch_premium_index_klines(symbol: str, interval: str = "1m", limit: int = 6
     except Exception:
         return None, None
 
-# ---------- Optional WS (kept for future use) ----------
+def fetch_premium_series(symbol: str, interval: str = "1m", limit: int = 120) -> List[float]:
+    """Return list of last premium closes; [] on failure."""
+    try:
+        url = "https://fapi.binance.com/futures/data/premiumIndexKlines"
+        data = _robust_get(url, {"symbol": symbol.upper(), "interval": interval, "limit": min(1000,limit)}, prefer_proxy=True)
+        vals = [float(x[4]) for x in data if isinstance(x, list) and len(x) >= 7]
+        return vals[-limit:]
+    except Exception:
+        return []
+
+# ---------- Synthetic premium (fallback) ----------
+def fetch_price_futures(symbol: str) -> Optional[float]:
+    try:
+        url = "https://fapi.binance.com/fapi/v1/ticker/price"
+        j = _robust_get(url, {"symbol": symbol.upper()}, prefer_proxy=True)
+        return float(j.get("price", "0"))
+    except Exception:
+        return None
+
+def fetch_price_spot(symbol: str) -> Optional[float]:
+    try:
+        url = "https://api.binance.com/api/v3/ticker/price"
+        j = _robust_get(url, {"symbol": symbol.upper()}, prefer_proxy=True)
+        return float(j.get("price", "0"))
+    except Exception:
+        return None
+
+def fetch_synthetic_premium(symbol: str) -> Optional[float]:
+    f = fetch_price_futures(symbol)
+    s = fetch_price_spot(symbol)
+    if f is None or s is None or s == 0:
+        return None
+    return (f - s) / s
+
+# ---------- Optional WS ----------
 import websockets
 async def ws_stream(symbol: str = "btcusdt", interval: str = "1m", callback=None, max_msgs: int = 100):
     uri = f"wss://fstream.binance.com/ws/{symbol.lower()}@kline_{interval}"
