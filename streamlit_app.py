@@ -1,5 +1,10 @@
-# streamlit_app.py — v1.9.1
-# BTC dashboard: matrix-first layout, per-TF RV20, adaptive confidence, auto Plan A/B with chart overlays (fixed)
+# streamlit_app.py — v1.9.2
+# BTC dashboard: matrix-first layout, per-TF RV20, adaptive confidence, auto Plan A/B with chart overlays
+# NEW in 1.9.2:
+# - Real auto-refresh every 60s (optional) + cache "seed" so loaders rerun once/minute
+# - Explicit "last CLOSED bar" badge (no repaint)
+# - Small help captions/clarifications
+
 import os, json, math, time, re, requests, pandas as pd, numpy as np
 import streamlit as st
 from datetime import datetime, timezone, timedelta
@@ -34,32 +39,24 @@ st.set_page_config(page_title="BTC — Regime, Signals & Futures Context", layou
 
 # ========= SIDEBAR =========
 st.sidebar.header("Data & Options")
-symbol = st.sidebar.selectbox("Symbol", SYMBOLS, index=0)
-report_url = st.sidebar.text_input("GitHub Pages report.json (debug)", value=REPORT_URL_DEFAULT)
-cf_worker = st.sidebar.text_input("Cloudflare Worker (optional)", value=CF_WORKER_DEFAULT)
+symbol = st.sidebar.selectbox("Symbol", SYMBOLS, index=0, help="Perp/spot ticker used for prices & context.")
+report_url = st.sidebar.text_input("GitHub Pages report.json (debug)", value=REPORT_URL_DEFAULT, help="Optional. Shows raw/pivot from your GH Pages report for verification.")
+cf_worker = st.sidebar.text_input("Cloudflare Worker (optional)", value=CF_WORKER_DEFAULT, help="If set, API calls to Binance can be proxied via this URL.")
+
 overlay_plan = st.sidebar.checkbox("Draw Plan A/B on chart (1h)", value=True)
 extra_emas = st.sidebar.multiselect("Extra EMAs (on chart)", options=[100, 400, 800], default=[400])
-auto_refresh = st.sidebar.checkbox("Auto-refresh (60s)", value=False)
+auto_refresh = st.sidebar.checkbox(
+    "Auto-refresh UI every 60s (uses last CLOSED bar; no repaint)",
+    value=False
+)
+
+# Force client-side reload every 60s + create a seed that invalidates caches once/minute
+refresh_seed = None
 if auto_refresh:
-    # Streamlit ≥1.30: st.query_params is a mutable mapping
-    # Keep value as string to be safe across versions.
-    try:
-        st.query_params["_"] = str(int(time.time()))
-    except Exception:
-        # Older/edge versions: just ignore if not available
-        pass
+    refresh_seed = int(time.time() // 60)  # changes once/minute
+    st.markdown("<script>setTimeout(function(){location.reload();}, 60000);</script>", unsafe_allow_html=True)
+
 st.sidebar.caption("Prices: Binance→OKX→Coinbase. FR/OI: Binance→OKX. Worker, if set, proxies Binance.")
-
-import os, streamlit as st
-st.sidebar.markdown("### Debug")
-try:
-    pages = os.listdir("pages")
-    core = os.listdir("core")
-    st.sidebar.write("📁 pages:", pages)
-    st.sidebar.write("📁 core:", core)
-except Exception as e:
-    st.sidebar.error(f"Cannot list dirs: {e}")
-
 
 # ========= HTTP helpers =========
 def build_worker_url(worker_base: str, full_upstream_url: str) -> str:
@@ -91,7 +88,7 @@ def http_text(url: str, timeout=8):
 
 # ========= report.json (debug) =========
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_report(url: str):
+def fetch_report(url: str, _seed=None):
     r = requests.get(url, timeout=15); r.raise_for_status()
     payload = json.loads(r.content.decode("utf-8"))
     if not isinstance(payload, dict) or "data" not in payload:
@@ -100,7 +97,7 @@ def fetch_report(url: str):
 
 # ========= Funding & OI =========
 @st.cache_data(ttl=120, show_spinner=False)
-def fetch_funding(symbol: str, limit: int = 48):
+def fetch_funding(symbol: str, limit: int = 48, _seed=None):
     try:
         base = f"{FAPI_BASES[0]}/fapi/v1/fundingRate"
         data = http_json(base, params={"symbol": symbol, "limit": min(1000,limit)}, allow_worker=bool(cf_worker))
@@ -128,7 +125,7 @@ def fetch_funding(symbol: str, limit: int = 48):
         return None, "none"
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_open_interest(symbol: str):
+def fetch_open_interest(symbol: str, _seed=None):
     try:
         j = http_json(f"{FAPI_BASES[0]}/fapi/v1/openInterest", params={"symbol": symbol}, allow_worker=bool(cf_worker))
         if isinstance(j, dict) and "openInterest" in j:
@@ -194,7 +191,7 @@ def _coinbase_klines(symbol: str, interval: str, limit: int):
     return _to_df_coinbase(data), "coinbase"
 
 @st.cache_data(ttl=60, show_spinner=False)
-def get_klines_df(symbol: str, interval: str, limit: int = 1000):
+def get_klines_df(symbol: str, interval: str, limit: int = 1000, _seed=None):
     errs=[]
     try: df, src = _binance_spot_klines(symbol, interval, limit, cf_worker); return df, src
     except Exception as e: errs.append(f"binance:{e}")
@@ -268,8 +265,8 @@ def trend_flags(df):
     }
 
 def regime_score(sig):
-    adx = sig.get("adx14",0)
-    conf = "high" if adx >= 28 else ("medium" if adx >= 22 else "low")
+    adx_v = sig.get("adx14",0)
+    conf = "high" if adx_v >= 28 else ("medium" if adx_v >= 22 else "low")
     score = (1 if sig["price_vs_ema200"]=="above" else -1) + (1 if sig["ema20_cross_50"]=="bull" else -1) + (1 if sig["macd_cross"]=="bull" else -1)
     label = "Trend ↑" if score >= 2 else ("Sideways" if -1 <= score <= 1 else "Trend ↓")
     return score, conf, label
@@ -294,22 +291,23 @@ def kpretty(x):
 
 # ========= CORE LOAD =========
 @st.cache_data(ttl=60, show_spinner=False)
-def get_all_tf_data(symbol: str, tfs: list[str], limit_each: int = 1000):
+def get_all_tf_data(symbol: str, tfs: list[str], limit_each: int = 1000, _seed=None):
     out = {}
     for tf in tfs:
-        df, src = get_klines_df(symbol, tf, limit=limit_each)
+        df, src = get_klines_df(symbol, tf, limit=limit_each, _seed=_seed)
         df = drop_unclosed(df, tf)
         out[tf] = (df, src)
     return out
 
 try:
-    tf_data = get_all_tf_data(symbol, TFS, limit_each=1000)
+    tf_data = get_all_tf_data(symbol, TFS, limit_each=1000, _seed=refresh_seed)
 except Exception as e:
     st.error(f"Klines failed: {e}"); st.stop()
 
 # Use 1h for chart & plan
 df_1h, src_chart = tf_data["1h"]
-last_ts = df_1h["ts"].iloc[-1]; last_close = float(df_1h["close"].iloc[-1])
+last_closed_bar_time = df_1h["ts"].iloc[-1]  # guaranteed closed
+last_close = float(df_1h["close"].iloc[-1])
 st.caption(f"Prices: **{src_chart}**  ·  Worker: {'ON' if cf_worker else 'OFF'}")
 
 # ========= SIGNALS & aggregate =========
@@ -335,20 +333,21 @@ rv20_1h = realized_vol_series(s_1h, 20).iloc[-1] * 100
 rv60_1h = realized_vol_series(s_1h, 60).iloc[-1] * 100
 cA, cB, cC, cD = st.columns([1.2,1.2,1.2,1.2])
 cA.metric("Regime (aggregate)", f"{agg['label']}", f"conf: {agg['conf']}")
-cB.metric("Last Close (1h)", kpretty(last_close), last_ts.strftime("%Y-%m-%d %H:%M UTC"))
+cB.metric("Last Close (1h)", kpretty(last_close), last_closed_bar_time.strftime("%Y-%m-%d %H:%M UTC"))
 cC.metric("RV20% (1h, annualized)", f"{rv20_1h:0.1f}%")
 cD.metric("RV60% (1h, annualized)", f"{rv60_1h:0.1f}%")
+st.caption("Using **last CLOSED** 1h bar (no repaint). The current 1h bar is excluded until it closes.")
 
 # Funding / OI
-fdf, fsrc = fetch_funding(symbol, limit=48)
-odf, osrc = fetch_open_interest(symbol)
+fdf, fsrc = fetch_funding(symbol, limit=48, _seed=refresh_seed)
+odf, osrc = fetch_open_interest(symbol, _seed=refresh_seed)
 last_funding = float(fdf["fundingRate"].iloc[-1]) if isinstance(fdf, pd.DataFrame) and not fdf.empty else None
 funding_str, funding_level, funding_side = funding_tilt(last_funding)
 fund_mean_24h = float(fdf["fundingRate"].tail(3).mean()) if isinstance(fdf, pd.DataFrame) and len(fdf) >= 3 else None
 
 # News (24h)
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_news(feeds: list[str], lookback_hours: int = 24, max_items: int = 8):
+def fetch_news(feeds: list[str], lookback_hours: int = 24, max_items: int = 8, _seed=None):
     out = []; cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
     for u in feeds:
         try:
@@ -377,7 +376,7 @@ def fetch_news(feeds: list[str], lookback_hours: int = 24, max_items: int = 8):
         seen.add(it["link"]); dedup.append(it)
     return dedup[:max_items]
 
-news_items = fetch_news(NEWS_FEEDS, NEWS_LOOKBACK_HOURS, 8)
+news_items = fetch_news(NEWS_FEEDS, NEWS_LOOKBACK_HOURS, 8, _seed=refresh_seed)
 news_risk = "elevated" if news_items and any(re.search(r"(hack|exploit|liquidat|halt|delay|lawsuit|ban|shutdown|outage|security|CPI|rate)", n["title"], flags=re.I) for n in news_items[:5]) else "normal"
 
 # Narrative
@@ -442,17 +441,6 @@ st.markdown("\n".join([f"- {ln}" for ln in tale_lines]))
 st.markdown(f"**{plan['note']}**  \n*Plan B:* {plan['alt']}")
 
 # ========= Matrix =========
-def realized_vol_series(s, win=20):
-    ret = s.pct_change().dropna()
-    stdev = ret.rolling(win).std()
-    if len(s) >= 2:
-        step = int((s.index[-1] - s.index[-2]).total_seconds())
-    else:
-        step = TF_SECONDS["1h"]
-    per_day = int(86400/max(step,1))
-    per_year = max(1, 365*per_day)
-    return stdev * math.sqrt(per_year)
-
 def tf_row(tframe):
     df2, _ = tf_data[tframe]
     s2 = signals[tframe]
@@ -518,14 +506,14 @@ with st.expander("Legend", expanded=False):
 - **adx** — trend strength (**high ≥28**, **medium 22–28**, **low <22**).  
 - **rv20%** — annualized realized volatility from last 20 bars of that TF.  
 - **recommend** — per-TF action: **Buy dips / Sell rips / Range trade**.  
-- **score/label/conf** derive from alignment checks and ADX bands above.
+- Using **last CLOSED** bar on each TF to avoid repaint.
         """.strip()
     )
 
-# ========= CHART (1h, fixed & simplified) =========
+# ========= CHART (1h) =========
 with st.expander("Chart (1h)", expanded=True):
     df = df_1h.copy()
-    x_ts = df["ts"]                      # <-- single timestamp axis everywhere
+    x_ts = df["ts"]
     close_s = df["close"]
     ema20s, ema50s, ema200s = ema(close_s,20), ema(close_s,50), ema(close_s,200)
 
@@ -582,7 +570,7 @@ with st.expander("Funding & Open Interest (Futures context)"):
 
 # ========= NEWS =========
 with st.expander("News (last 24h)", expanded=False):
-    items = fetch_news(NEWS_FEEDS, NEWS_LOOKBACK_HOURS, 8)
+    items = fetch_news(NEWS_FEEDS, NEWS_LOOKBACK_HOURS, 8, _seed=refresh_seed)
     if items:
         for n in items:
             ts = n["ts"].strftime("%Y-%m-%d %H:%M UTC")
@@ -593,7 +581,7 @@ with st.expander("News (last 24h)", expanded=False):
 # ========= report.json (debug) =========
 payload = None
 if report_url:
-    try: payload = fetch_report(report_url)
+    try: payload = fetch_report(report_url, _seed=refresh_seed)
     except Exception: payload = None
 
 if payload:
