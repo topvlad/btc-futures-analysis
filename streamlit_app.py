@@ -1,9 +1,6 @@
-# streamlit_app.py — v1.9.2
-# BTC dashboard: matrix-first layout, per-TF RV20, adaptive confidence, auto Plan A/B with chart overlays
-# NEW in 1.9.2:
-# - Real auto-refresh every 60s (optional) + cache "seed" so loaders rerun once/minute
-# - Explicit "last CLOSED bar" badge (no repaint)
-# - Small help captions/clarifications
+# streamlit_app.py — v1.10.1
+# Top-N crypto dashboard (CoinGecko → Binance USDT-perps), regime & RVs, Plan A/B, chart overlays.
+# Fixes: proper universe seed for cache-busting; safe fallbacks; closed-bar, auto-refresh, generic OKX.
 
 import os, json, math, time, re, requests, pandas as pd, numpy as np
 import streamlit as st
@@ -19,7 +16,6 @@ except Exception:
 
 # ========= CONFIG =========
 REPORT_URL_DEFAULT = "https://topvlad.github.io/btc-futures-analysis/report.json"
-SYMBOLS = ["BTCUSDT", "BTCUSDC"]
 TFS = ["15m", "1h", "4h", "1d"]
 TF_SECONDS = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
 
@@ -29,36 +25,32 @@ FAPI_BASES = ["https://fapi.binance.com","https://fapi1.binance.com","https://fa
 CF_WORKER_DEFAULT = os.getenv("CF_WORKER_URL", "https://binance-proxy.brokerof-net.workers.dev")
 
 NEWS_FEEDS = [
-    "https://news.google.com/rss/search?q=Bitcoin&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=crypto&hl=en-US&gl=US&ceid=US:en",
     "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml",
     "https://cointelegraph.com/rss",
 ]
 NEWS_LOOKBACK_HOURS = 24
 
-st.set_page_config(page_title="BTC — Regime, Signals & Futures Context", layout="wide")
+COIN_NAME = {
+    "BTC":"Bitcoin","ETH":"Ethereum","BNB":"BNB","SOL":"Solana","XRP":"XRP",
+    "ADA":"Cardano","DOGE":"Dogecoin","TON":"Toncoin","TRX":"TRON","LINK":"Chainlink",
+    "APT":"Aptos","ARB":"Arbitrum","SUI":"Sui","MATIC":"Polygon","PEPE":"Pepe",
+    "LTC":"Litecoin","BCH":"Bitcoin Cash","DOT":"Polkadot","AVAX":"Avalanche",
+}
 
-# ========= SIDEBAR =========
-st.sidebar.header("Data & Options")
-symbol = st.sidebar.selectbox("Symbol", SYMBOLS, index=0, help="Perp/spot ticker used for prices & context.")
-report_url = st.sidebar.text_input("GitHub Pages report.json (debug)", value=REPORT_URL_DEFAULT, help="Optional. Shows raw/pivot from your GH Pages report for verification.")
-cf_worker = st.sidebar.text_input("Cloudflare Worker (optional)", value=CF_WORKER_DEFAULT, help="If set, API calls to Binance can be proxied via this URL.")
+st.set_page_config(page_title="Top-N — Regime, Signals & Futures Context", layout="wide")
 
-overlay_plan = st.sidebar.checkbox("Draw Plan A/B on chart (1h)", value=True)
-extra_emas = st.sidebar.multiselect("Extra EMAs (on chart)", options=[100, 400, 800], default=[400])
-auto_refresh = st.sidebar.checkbox(
-    "Auto-refresh UI every 60s (uses last CLOSED bar; no repaint)",
-    value=False
-)
+# ========= UTILITIES =========
+def _base_from_symbol(symbol: str) -> str:
+    s = symbol.upper()
+    if s.endswith("USDT"): return s[:-4]
+    if s.endswith("USDC"): return s[:-4]
+    return s
 
-# Force client-side reload every 60s + create a seed that invalidates caches once/minute
-refresh_seed = None
-if auto_refresh:
-    refresh_seed = int(time.time() // 60)  # changes once/minute
-    st.markdown("<script>setTimeout(function(){location.reload();}, 60000);</script>", unsafe_allow_html=True)
+def _news_term(symbol: str) -> str:
+    base = _base_from_symbol(symbol)
+    return COIN_NAME.get(base, base)
 
-st.sidebar.caption("Prices: Binance→OKX→Coinbase. FR/OI: Binance→OKX. Worker, if set, proxies Binance.")
-
-# ========= HTTP helpers =========
 def build_worker_url(worker_base: str, full_upstream_url: str) -> str:
     if not worker_base: return full_upstream_url
     return f"{worker_base.rstrip('/')}/?u={quote(full_upstream_url, safe='')}"
@@ -72,7 +64,8 @@ def http_json(url: str, params=None, timeout=8, allow_worker=False):
     last_e = None
     for label, full, p in attempts:
         try:
-            r = requests.get(full, params=None if label=="WORKER" else p, timeout=timeout)
+            r = requests.get(full, params=None if label=="WORKER" else p, timeout=timeout,
+                             headers={"Accept":"application/json","User-Agent":"binfapp/1.10.1"})
             if r.status_code != 200: last_e = f"status {r.status_code}"; continue
             ct = (r.headers.get("content-type") or "").lower()
             if "application/json" not in ct and not ("/klines" in full or "/candles" in full):
@@ -83,69 +76,103 @@ def http_json(url: str, params=None, timeout=8, allow_worker=False):
     raise RuntimeError(f"http_json failed: {last_e}")
 
 def http_text(url: str, timeout=8):
-    r = requests.get(url, timeout=timeout); r.raise_for_status()
+    r = requests.get(url, timeout=timeout, headers={"User-Agent":"binfapp/1.10.1"}); r.raise_for_status()
     return r.text
 
-# ========= report.json (debug) =========
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_report(url: str, _seed=None):
-    r = requests.get(url, timeout=15); r.raise_for_status()
-    payload = json.loads(r.content.decode("utf-8"))
-    if not isinstance(payload, dict) or "data" not in payload:
-        raise RuntimeError("Bad report.json schema.")
-    return payload
+# ========= DYNAMIC UNIVERSE (Top-N by mcap) =========
+TOPN_DEFAULT = 10
 
-# ========= Funding & OI =========
-@st.cache_data(ttl=120, show_spinner=False)
-def fetch_funding(symbol: str, limit: int = 48, _seed=None):
+@st.cache_data(ttl=3600, show_spinner=False)
+def _discover_top_coins(top_n: int = TOPN_DEFAULT, _seed=None):
+    """Return list of base tickers like ['BTC','ETH', ...] using CoinGecko."""
     try:
-        base = f"{FAPI_BASES[0]}/fapi/v1/fundingRate"
-        data = http_json(base, params={"symbol": symbol, "limit": min(1000,limit)}, allow_worker=bool(cf_worker))
-        if isinstance(data, list) and data:
-            df = pd.DataFrame(data)
-            df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
-            df["fundingTime"] = pd.to_datetime(df["fundingTime"], unit="ms", utc=True)
-            df = df.dropna().sort_values("fundingTime")
-            return df, "binance"
+        j = requests.get(
+            "https://api.coingecko.com/api/v3/coins/markets",
+            params={"vs_currency": "usd", "order": "market_cap_desc", "per_page": 60, "page": 1},
+            timeout=8, headers={"Accept":"application/json","User-Agent":"binfapp/1.10.1"}
+        ).json()
+        bases = []
+        for it in j:
+            sym = (it.get("symbol") or "").upper().strip()
+            if sym in ("USDT","USDC","FDUSD","TUSD","DAI","USDD","USDE","PYUSD"):
+                continue
+            sym = {"XBT":"BTC","WETH":"ETH"}.get(sym, sym)  # rare remaps
+            bases.append(sym)
+        seen, uniq = set(), []
+        for b in bases:
+            if b not in seen:
+                seen.add(b); uniq.append(b)
+            if len(uniq) >= max(1, top_n): break
+        return uniq
     except Exception:
-        pass
-    # OKX fallback
-    try:
-        inst = "BTC-USDT-SWAP" if symbol.endswith("USDT") else "BTC-USDC-SWAP"
-        j = http_json("https://www.okx.com/api/v5/public/funding-rate-history",
-                      params={"instId": inst, "limit": min(100, limit)}, timeout=8)
-        arr = j.get("data") or []
-        if not arr: return None, "okx_empty"
-        df = pd.DataFrame(arr)
-        df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
-        df["fundingTime"] = pd.to_datetime(pd.to_numeric(df["fundingTime"], errors="coerce"), unit="ms", utc=True)
-        df = df.dropna().sort_values("fundingTime")
-        return df, "okx"
-    except Exception:
-        return None, "none"
+        return ["BTC","ETH","BNB","SOL","XRP","ADA","DOGE","TON","TRX","LINK"]
 
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_open_interest(symbol: str, _seed=None):
+@st.cache_data(ttl=3600, show_spinner=False)
+def _binance_futures_universe(candidates: list[str], _seed=None):
+    """Filter to symbols that exist as USDT perps on Binance Futures."""
     try:
-        j = http_json(f"{FAPI_BASES[0]}/fapi/v1/openInterest", params={"symbol": symbol}, allow_worker=bool(cf_worker))
-        if isinstance(j, dict) and "openInterest" in j:
-            val = float(j.get("openInterest") or 0.0)
-            ts = datetime.now(timezone.utc)
-            return pd.DataFrame({"ts":[ts], "oi":[val]}), "binance"
+        ex = http_json(f"{FAPI_BASES[0]}/fapi/v1/exchangeInfo", timeout=10, allow_worker=bool(CF_WORKER_DEFAULT))
+        syms = ex.get("symbols", []) if isinstance(ex, dict) else []
+        tradeables = {s["symbol"] for s in syms
+                      if s.get("quoteAsset") == "USDT"
+                      and s.get("status") == "TRADING"
+                      and s.get("contractType","PERPETUAL").upper() in ("PERPETUAL","CURRENT_QUARTER","NEXT_QUARTER")}
+        out = []
+        base_map = {
+            "IOTA":"IOTA","WBTC":"BTC","BCH":"BCH","TON":"TON","SHIB":"SHIB",
+            "MATIC":"MATIC","PEPE":"PEPE","SUI":"SUI","APT":"APT","ARB":"ARB",
+            "AVAX":"AVAX","LTC":"LTC","DOT":"DOT","LINK":"LINK",
+        }
+        for base in candidates:
+            b = base_map.get(base, base)
+            cand = f"{b}USDT"
+            if cand in tradeables:
+                out.append(cand)
+        return out
     except Exception:
-        pass
-    try:
-        uly = "BTC-USDT" if symbol.endswith("USDT") else "BTC-USDC"
-        j = http_json("https://www.okx.com/api/v5/public/open-interest", params={"instType":"SWAP","uly":uly}, timeout=8)
-        arr = j.get("data") or []
-        if not arr: return None, "okx_empty"
-        oi = float(arr[0].get("oi") or 0.0)
-        ts = datetime.now(timezone.utc)
-        return pd.DataFrame({"ts":[ts], "oi":[oi]}), "okx"
-    except Exception:
-        return None, "none"
+        return [f"{b}USDT" for b in ["BTC","ETH","BNB","SOL","XRP","ADA","DOGE","TON","TRX","LINK"]]
 
-# ========= Spot klines (providers) =========
+# ========= SIDEBAR (universe controls first) =========
+st.sidebar.header("Data & Options")
+
+# Universe controls + seed for manual refresh
+topn = st.sidebar.number_input("Universe size (Top-N by market cap)", min_value=5, max_value=30,
+                               value=TOPN_DEFAULT, step=1,
+                               help="Coins from CoinGecko top market caps, filtered to Binance USDT perps.")
+if "universe_seed" not in st.session_state:
+    st.session_state.universe_seed = 0
+if st.sidebar.button("↻ Refresh universe now", help="Force refresh of the Top-N list (bypass 1h cache)."):
+    st.session_state.universe_seed = int(time.time())
+
+# Build the dynamic universe using the seed for cache keys
+bases = _discover_top_coins(topn, _seed=st.session_state.universe_seed)
+SYMBOLS = _binance_futures_universe(bases, _seed=st.session_state.universe_seed)
+if not SYMBOLS:
+    SYMBOLS = ["BTCUSDT","ETHUSDT"]  # safety fallback
+# Ensure BTC first if present
+if "BTCUSDT" in SYMBOLS:
+    SYMBOLS.remove("BTCUSDT"); SYMBOLS.insert(0, "BTCUSDT")
+
+# Universe badge
+st.sidebar.caption(f"Universe: {', '.join([_base_from_symbol(s) for s in SYMBOLS[:10]])}{'…' if len(SYMBOLS)>10 else ''}")
+
+# Rest of options
+symbol = st.sidebar.selectbox("Symbol", SYMBOLS, index=0, help="Binance USDT perpetual/spot-compatible symbol.")
+report_url = st.sidebar.text_input("GitHub Pages report.json (debug)", value=REPORT_URL_DEFAULT)
+cf_worker = st.sidebar.text_input("Cloudflare Worker (optional)", value=CF_WORKER_DEFAULT)
+overlay_plan = st.sidebar.checkbox("Draw Plan A/B on chart (1h)", value=True)
+extra_emas = st.sidebar.multiselect("Extra EMAs (on chart)", options=[100, 400, 800], default=[400])
+auto_refresh = st.sidebar.checkbox("Auto-refresh UI every 60s (uses last CLOSED bar; no repaint)", value=False)
+
+# Auto-refresh: client reload + cache seed
+refresh_seed = None
+if auto_refresh:
+    refresh_seed = int(time.time() // 60)  # changes once/min
+    st.markdown("<script>setTimeout(function(){location.reload();}, 60000);</script>", unsafe_allow_html=True)
+
+st.sidebar.caption("Prices: Binance→OKX→Coinbase. FR/OI: Binance→OKX. Worker, if set, proxies Binance.")
+
+# ========= DATA HELPERS =========
 def _to_df_binance(raw):
     cols = ["openTime","open","high","low","close","volume","closeTime","qav","numTrades","takerBase","takerQuote","ignore"]
     df = pd.DataFrame(raw, columns=cols)
@@ -175,16 +202,20 @@ def _binance_spot_klines(symbol: str, interval: str, limit: int, worker_url: str
         return _to_df_binance(data), f"binance({base})"
 
 def _okx_klines(symbol: str, interval: str, limit: int):
-    inst = "BTC-USDT" if symbol.endswith("USDT") else "BTC-USDC"
+    base = _base_from_symbol(symbol)
+    inst = f"{base}-USDT"
     bar_map = {"15m":"15m","1h":"1H","4h":"4H","1d":"1D"}
     bar = bar_map.get(interval, "1H")
-    j = http_json("https://www.okx.com/api/v5/market/candles", params={"instId": inst, "bar": bar, "limit": min(500,limit)}, timeout=8)
+    j = http_json("https://www.okx.com/api/v5/market/candles",
+                  params={"instId": inst, "bar": bar, "limit": min(500,limit)}, timeout=8)
     data = j.get("data") or []
     if not data: raise RuntimeError("OKX empty")
     return _to_df_okx(data), "okx"
 
 def _coinbase_klines(symbol: str, interval: str, limit: int):
-    product = "BTC-USD"
+    base = _base_from_symbol(symbol)
+    product_map = {"BTC":"BTC-USD","ETH":"ETH-USD"}
+    product = product_map.get(base, "BTC-USD")
     gran = {"15m":900,"1h":3600,"4h":14400,"1d":86400}.get(interval, 3600)
     data = http_json(f"https://api.exchange.coinbase.com/products/{product}/candles", params={"granularity": gran, "limit": min(300,limit)}, timeout=8)
     if not isinstance(data, list) or not data: raise RuntimeError("Coinbase empty")
@@ -236,14 +267,12 @@ def drop_unclosed(df, interval):
     return out if not out.empty else df
 
 def realized_vol_series(s, win=20):
-    ret = s.pct_change().dropna()
-    stdev = ret.rolling(win).std()
+    ret = s.pct_change().dropna(); stdev = ret.rolling(win).std()
     if len(s) >= 2:
         step = int((s.index[-1] - s.index[-2]).total_seconds())
     else:
         step = TF_SECONDS["1h"]
-    per_day = int(86400/max(step,1))
-    per_year = max(1, 365*per_day)
+    per_day = int(86400/max(step,1)); per_year = max(1, 365*per_day)
     return stdev * math.sqrt(per_year)
 
 def trend_flags(df):
@@ -300,7 +329,7 @@ def get_all_tf_data(symbol: str, tfs: list[str], limit_each: int = 1000, _seed=N
     return out
 
 try:
-    tf_data = get_all_tf_data(symbol, TFS, limit_each=1000, _seed=refresh_seed)
+    tf_data = get_all_tf_data(symbol, TFS, limit_each=1000, _seed=(refresh_seed if auto_refresh else None))
 except Exception as e:
     st.error(f"Klines failed: {e}"); st.stop()
 
@@ -336,19 +365,68 @@ cA.metric("Regime (aggregate)", f"{agg['label']}", f"conf: {agg['conf']}")
 cB.metric("Last Close (1h)", kpretty(last_close), last_closed_bar_time.strftime("%Y-%m-%d %H:%M UTC"))
 cC.metric("RV20% (1h, annualized)", f"{rv20_1h:0.1f}%")
 cD.metric("RV60% (1h, annualized)", f"{rv60_1h:0.1f}%")
-st.caption("Using **last CLOSED** 1h bar (no repaint). The current 1h bar is excluded until it closes.")
+st.caption("Using **last CLOSED** 1h bar (no repaint). Current 1h bar is excluded until it closes.")
 
-# Funding / OI
-fdf, fsrc = fetch_funding(symbol, limit=48, _seed=refresh_seed)
-odf, osrc = fetch_open_interest(symbol, _seed=refresh_seed)
+# ========= Funding & OI =========
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_funding(symbol: str, limit: int = 48, _seed=None):
+    try:
+        base = f"{FAPI_BASES[0]}/fapi/v1/fundingRate"
+        data = http_json(base, params={"symbol": symbol, "limit": min(1000,limit)}, allow_worker=bool(cf_worker))
+        if isinstance(data, list) and data:
+            df = pd.DataFrame(data)
+            df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
+            df["fundingTime"] = pd.to_datetime(df["fundingTime"], unit="ms", utc=True)
+            df = df.dropna().sort_values("fundingTime")
+            return df, "binance"
+    except Exception:
+        pass
+    try:
+        inst = f"{_base_from_symbol(symbol)}-USDT-SWAP"
+        j = http_json("https://www.okx.com/api/v5/public/funding-rate-history",
+                      params={"instId": inst, "limit": min(100, limit)}, timeout=8)
+        arr = j.get("data") or []
+        if not arr: return None, "okx_empty"
+        df = pd.DataFrame(arr)
+        df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
+        df["fundingTime"] = pd.to_datetime(pd.to_numeric(df["fundingTime"], errors="coerce"), unit="ms", utc=True)
+        df = df.dropna().sort_values("fundingTime")
+        return df, "okx"
+    except Exception:
+        return None, "none"
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_open_interest(symbol: str, _seed=None):
+    try:
+        j = http_json(f"{FAPI_BASES[0]}/fapi/v1/openInterest", params={"symbol": symbol}, allow_worker=bool(cf_worker))
+        if isinstance(j, dict) and "openInterest" in j:
+            val = float(j.get("openInterest") or 0.0)
+            ts = datetime.now(timezone.utc)
+            return pd.DataFrame({"ts":[ts], "oi":[val]}), "binance"
+    except Exception:
+        pass
+    try:
+        uly = f"{_base_from_symbol(symbol)}-USDT"
+        j = http_json("https://www.okx.com/api/v5/public/open-interest", params={"instType":"SWAP","uly":uly}, timeout=8)
+        arr = j.get("data") or []
+        if not arr: return None, "okx_empty"
+        oi = float(arr[0].get("oi") or 0.0)
+        ts = datetime.now(timezone.utc)
+        return pd.DataFrame({"ts":[ts], "oi":[oi]}), "okx"
+    except Exception:
+        return None, "none"
+
+fdf, fsrc = fetch_funding(symbol, limit=48, _seed=(refresh_seed if auto_refresh else None))
+odf, osrc = fetch_open_interest(symbol, _seed=(refresh_seed if auto_refresh else None))
 last_funding = float(fdf["fundingRate"].iloc[-1]) if isinstance(fdf, pd.DataFrame) and not fdf.empty else None
 funding_str, funding_level, funding_side = funding_tilt(last_funding)
 fund_mean_24h = float(fdf["fundingRate"].tail(3).mean()) if isinstance(fdf, pd.DataFrame) and len(fdf) >= 3 else None
 
-# News (24h)
+# ========= News (24h, per coin) =========
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_news(feeds: list[str], lookback_hours: int = 24, max_items: int = 8, _seed=None):
+def fetch_news(feeds: list[str], lookback_hours: int = 24, max_items: int = 8, term: str = "Bitcoin", _seed=None):
     out = []; cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    patt = re.compile(fr"\b({re.escape(term)}|{re.escape(term.split()[0])})\b", re.I)
     for u in feeds:
         try:
             xml = http_text(u, timeout=8)
@@ -360,7 +438,7 @@ def fetch_news(feeds: list[str], lookback_hours: int = 24, max_items: int = 8, _
                 link  = re.sub(r"<.*?>", "", (link_match.group(1).strip() if link_match else ""))
                 pub   = (date_match.group(1).strip() if date_match else None)
                 if not title or not link: continue
-                if not re.search(r"\b(btc|bitcoin)\b", title, flags=re.I): continue
+                if not patt.search(title): continue
                 try:
                     dt = parsedate_to_datetime(pub)
                     if not dt.tzinfo: dt = dt.replace(tzinfo=timezone.utc)
@@ -376,10 +454,11 @@ def fetch_news(feeds: list[str], lookback_hours: int = 24, max_items: int = 8, _
         seen.add(it["link"]); dedup.append(it)
     return dedup[:max_items]
 
-news_items = fetch_news(NEWS_FEEDS, NEWS_LOOKBACK_HOURS, 8, _seed=refresh_seed)
+news_items = fetch_news(NEWS_FEEDS, NEWS_LOOKBACK_HOURS, 8, term=_news_term(symbol),
+                        _seed=(refresh_seed if auto_refresh else None))
 news_risk = "elevated" if news_items and any(re.search(r"(hack|exploit|liquidat|halt|delay|lawsuit|ban|shutdown|outage|security|CPI|rate)", n["title"], flags=re.I) for n in news_items[:5]) else "normal"
 
-# Narrative
+# ========= Narrative =========
 def narrative_story(agg, signals, funding_level, funding_side, fund_mean_24h, news_risk):
     s1h, s4h, sd = signals["1h"], signals["4h"], signals["1d"]
     lines = []
@@ -402,7 +481,7 @@ def narrative_story(agg, signals, funding_level, funding_side, fund_mean_24h, ne
 
 tale_lines = narrative_story(agg, signals, funding_level, funding_side, fund_mean_24h, news_risk)
 
-# Plans (1h)
+# ========= Plans (1h) =========
 def swing_levels(df, lookback=30):
     highs = df["high"].tail(lookback); lows = df["low"].tail(lookback)
     return float(highs.max()), float(lows.min())
@@ -513,8 +592,7 @@ with st.expander("Legend", expanded=False):
 # ========= CHART (1h) =========
 with st.expander("Chart (1h)", expanded=True):
     df = df_1h.copy()
-    x_ts = df["ts"]
-    close_s = df["close"]
+    x_ts = df["ts"]; close_s = df["close"]
     ema20s, ema50s, ema200s = ema(close_s,20), ema(close_s,50), ema(close_s,200)
 
     if not PLOTLY:
@@ -570,18 +648,26 @@ with st.expander("Funding & Open Interest (Futures context)"):
 
 # ========= NEWS =========
 with st.expander("News (last 24h)", expanded=False):
-    items = fetch_news(NEWS_FEEDS, NEWS_LOOKBACK_HOURS, 8, _seed=refresh_seed)
+    items = news_items
     if items:
         for n in items:
             ts = n["ts"].strftime("%Y-%m-%d %H:%M UTC")
             st.markdown(f"- [{n['title']}]({n['link']})  —  *{ts}*")
     else:
-        st.info("No fresh Bitcoin headlines found in the last 24h.")
+        st.info(f"No fresh {_news_term(symbol)} headlines found in the last 24h.")
 
 # ========= report.json (debug) =========
 payload = None
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_report(url: str, _seed=None):
+    r = requests.get(url, timeout=15); r.raise_for_status()
+    payload = json.loads(r.content.decode("utf-8"))
+    if not isinstance(payload, dict) or "data" not in payload:
+        raise RuntimeError("Bad report.json schema.")
+    return payload
+
 if report_url:
-    try: payload = fetch_report(report_url, _seed=refresh_seed)
+    try: payload = fetch_report(report_url, _seed=(refresh_seed if auto_refresh else None))
     except Exception: payload = None
 
 if payload:
