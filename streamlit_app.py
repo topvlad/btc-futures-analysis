@@ -1,6 +1,6 @@
-# streamlit_app.py — v1.10.1
+# streamlit_app.py — v1.10.2
 # Top-N crypto dashboard (CoinGecko → Binance USDT-perps), regime & RVs, Plan A/B, chart overlays.
-# Fixes: proper universe seed for cache-busting; safe fallbacks; closed-bar, auto-refresh, generic OKX.
+# v1.10.2: Adds concise dynamic explainer for RV20/RV60 right under the tiles.
 
 import os, json, math, time, re, requests, pandas as pd, numpy as np
 import streamlit as st
@@ -65,7 +65,7 @@ def http_json(url: str, params=None, timeout=8, allow_worker=False):
     for label, full, p in attempts:
         try:
             r = requests.get(full, params=None if label=="WORKER" else p, timeout=timeout,
-                             headers={"Accept":"application/json","User-Agent":"binfapp/1.10.1"})
+                             headers={"Accept":"application/json","User-Agent":"binfapp/1.10.2"})
             if r.status_code != 200: last_e = f"status {r.status_code}"; continue
             ct = (r.headers.get("content-type") or "").lower()
             if "application/json" not in ct and not ("/klines" in full or "/candles" in full):
@@ -76,7 +76,7 @@ def http_json(url: str, params=None, timeout=8, allow_worker=False):
     raise RuntimeError(f"http_json failed: {last_e}")
 
 def http_text(url: str, timeout=8):
-    r = requests.get(url, timeout=timeout, headers={"User-Agent":"binfapp/1.10.1"}); r.raise_for_status()
+    r = requests.get(url, timeout=timeout, headers={"User-Agent":"binfapp/1.10.2"}); r.raise_for_status()
     return r.text
 
 # ========= DYNAMIC UNIVERSE (Top-N by mcap) =========
@@ -89,7 +89,7 @@ def _discover_top_coins(top_n: int = TOPN_DEFAULT, _seed=None):
         j = requests.get(
             "https://api.coingecko.com/api/v3/coins/markets",
             params={"vs_currency": "usd", "order": "market_cap_desc", "per_page": 60, "page": 1},
-            timeout=8, headers={"Accept":"application/json","User-Agent":"binfapp/1.10.1"}
+            timeout=8, headers={"Accept":"application/json","User-Agent":"binfapp/1.10.2"}
         ).json()
         bases = []
         for it in j:
@@ -318,6 +318,30 @@ def kpretty(x):
     try: return f"{x:,.2f}"
     except Exception: return str(x)
 
+# === NEW: one-sentence RV explainer ===
+def rv_one_liner(rv20: float, rv60: float) -> str:
+    """
+    Return a concise, single-sentence explanation of RV20/RV60 relationship and level.
+    rv20/rv60 are percents (e.g., 58.4).
+    """
+    # relative skew
+    ratio = (rv20 / max(rv60, 1e-9))
+    if ratio >= 1.15:
+        skew = "short-term vol is rising vs trend (momentum bias; use wider stops)"
+    elif ratio <= 0.85:
+        skew = "short-term vol is cooling vs trend (mean-reversion bias; tighter stops ok)"
+    else:
+        skew = "short- and medium-term vol are aligned (no strong vol edge)"
+
+    # absolute regime from max of the two
+    hi = max(rv20, rv60)
+    if   hi >= 100: level = "very high"
+    elif hi >= 70:  level = "high"
+    elif hi >= 40:  level = "moderate"
+    else:           level = "calm"
+
+    return f"Volatility is **{level}**; {skew}."
+
 # ========= CORE LOAD =========
 @st.cache_data(ttl=60, show_spinner=False)
 def get_all_tf_data(symbol: str, tfs: list[str], limit_each: int = 1000, _seed=None):
@@ -365,6 +389,10 @@ cA.metric("Regime (aggregate)", f"{agg['label']}", f"conf: {agg['conf']}")
 cB.metric("Last Close (1h)", kpretty(last_close), last_closed_bar_time.strftime("%Y-%m-%d %H:%M UTC"))
 cC.metric("RV20% (1h, annualized)", f"{rv20_1h:0.1f}%")
 cD.metric("RV60% (1h, annualized)", f"{rv60_1h:0.1f}%")
+
+# NEW: the one-liner goes directly under the tiles (before the closed-bar caption)
+st.markdown(f"<div style='margin-top:-6px; color:#6b7280;'>{rv_one_liner(rv20_1h, rv60_1h)}</div>", unsafe_allow_html=True)
+
 st.caption("Using **last CLOSED** 1h bar (no repaint). Current 1h bar is excluded until it closes.")
 
 # ========= Funding & OI =========
