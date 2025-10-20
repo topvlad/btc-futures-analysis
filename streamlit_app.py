@@ -465,7 +465,7 @@ def universe_snapshot(symbols: list[str], max_symbols: int = 12, _seed=None):
 snap = universe_snapshot(SYMBOLS, max_symbols=topn, _seed=(refresh_seed if auto_refresh else None))
 
 # ========= MID SECTION: 2-cell layout =========
-left, spacer, right = st.columns([1.6, 0.06, 1.0])
+left, spacer, right = st.columns([1.3, 0.03, 1.6])
 
 # ---- LEFT: Narrative & Decision ----
 def narrative_story(agg, signals, funding_level, funding_side, fund_mean_24h, news_risk):
