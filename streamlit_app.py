@@ -616,9 +616,9 @@ with right:
   <table style="width:100%;border-collapse:collapse;">
     <thead>
       <tr>
-        <th style="text-align:left;border-bottom:1px solid #e5e7eb;padding:6px 4px;color:#6b7280;width:46%;">Parameter</th>
-        <th style="text-align:left;border-bottom:1px solid #e5e7eb;padding:6px 4px;color:#6b7280;width:22%;">Value</th>
-        <th style="text-align:left;border-bottom:1px solid #e5e7eb;padding:6px 4px;color:#6b7280;width:32%;">Note / dynamics</th>
+        <th style="text-align:left;border-bottom:1px solid #e5e7eb;padding:6px 4px;color:#6b7280;width:36%;">Parameter</th>
+        <th style="text-align:left;border-bottom:1px solid #e5e7eb;padding:6px 4px;color:#6b7280;width:20%;">Value</th>
+        <th style="text-align:left;border-bottom:1px solid #e5e7eb;padding:6px 4px;color:#6b7280;width:44%;">Note / dynamics</th>
       </tr>
     </thead>
     <tbody>
