@@ -578,7 +578,7 @@ news_items = fetch_news(NEWS_FEEDS, NEWS_LOOKBACK_HOURS, 8, term=_news_term(symb
 news_risk = "elevated" if news_items and any(re.search(r"(hack|exploit|liquidat|halt|delay|lawsuit|ban|shutdown|outage|security|CPI|rate)", n["title"], flags=re.I) for n in news_items[:5]) else "normal"
 
 with left:
-    st.subheader("Token Vitals (multi-TF analysis)")
+    st.subheader("Token Vitals (multi-TF)")
     st.markdown(
         f"Aggregate Regime: **{agg['label']}** (confidence: *{agg['conf']}*)<br>"
         f"<span style='color:#6b7280'>TF votes — ↑:{agg['ups']} / ↓:{agg['downs']} / ↔:{agg['sides']}</span>",
