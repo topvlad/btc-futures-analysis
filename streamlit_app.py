@@ -180,11 +180,11 @@ def _to_df_coinbase(raw):
 
 def _binance_spot_klines(symbol: str, interval: str, limit: int, worker_url: str | None):
     if worker_url:
-        upstream = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={min(1000,limit)}"
+        upstream = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={min(2000,limit)}"
         data = http_json(upstream, allow_worker=True)
         return _to_df_binance(data), "binance(worker)"
     for base in SPOT_BASES:
-        data = http_json(f"{base}/api/v3/klines", params={"symbol": symbol, "interval": interval, "limit": min(1000,limit)}, timeout=8)
+        data = http_json(f"{base}/api/v3/klines", params={"symbol": symbol, "interval": interval, "limit": min(2000,limit)}, timeout=8)
         return _to_df_binance(data), f"binance({base})"
 
 def _okx_klines(symbol: str, interval: str, limit: int):
@@ -322,7 +322,7 @@ def rv_one_liner(rv20: float, rv60: float) -> str:
 
 # ========= CORE LOAD =========
 @st.cache_data(ttl=60, show_spinner=False)
-def get_all_tf_data(symbol: str, tfs: list[str], limit_each: int = 1000, _seed=None):
+def get_all_tf_data(symbol: str, tfs: list[str], limit_each: int = 2000, _seed=None):
     out = {}
     for tf in tfs:
         df, src = get_klines_df(symbol, tf, limit=limit_each, _seed=_seed)
@@ -375,7 +375,7 @@ cD.metric("RV60% (1h, annualized)", f"{rv60_1h:0.1f}%")
 @st.cache_data(ttl=180, show_spinner=False)
 def _symbol_vitals(symbol: str):
     try:
-        df1h, _ = get_klines_df(symbol, "1h", limit=300)
+        df1h, _ = get_klines_df(symbol, "1h", limit=600)
         df1h = drop_unclosed(df1h, "1h")
         s = df1h.set_index("ts")["close"]
         rv20 = float(realized_vol_series(s, 20).iloc[-1] * 100)
