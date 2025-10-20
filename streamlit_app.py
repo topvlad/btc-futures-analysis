@@ -1,8 +1,5 @@
-# streamlit_app.py — v1.10.4
-# Top-N crypto dashboard (CoinGecko → Binance USDT-perps), regime & RVs, Plan A/B, chart overlays.
-# v1.10.2: RV one-liner
-# v1.10.3: right-side RV card + Top-N snapshot
-# v1.10.4: layout fix, no jargon, richer Top-N stats & "Universe guide" suggestion
+# streamlit_app.py — v1.11.0
+# Clean mid-layout (Narrative left, Top-N table right), notes for each metric, closed-bar & vol line under Prices.
 
 import os, json, math, time, re, requests, pandas as pd, numpy as np
 import streamlit as st
@@ -45,8 +42,7 @@ st.set_page_config(page_title="Top-N — Regime, Signals & Futures Context", lay
 # ========= UTILITIES =========
 def _base_from_symbol(symbol: str) -> str:
     s = symbol.upper()
-    if s.endswith("USDT"): return s[:-4]
-    if s.endswith("USDC"): return s[:-4]
+    if s.endswith("USDT") or s.endswith("USDC"): return s[:-4]
     return s
 
 def _news_term(symbol: str) -> str:
@@ -67,7 +63,7 @@ def http_json(url: str, params=None, timeout=8, allow_worker=False):
     for label, full, p in attempts:
         try:
             r = requests.get(full, params=None if label=="WORKER" else p, timeout=timeout,
-                             headers={"Accept":"application/json","User-Agent":"binfapp/1.10.4"})
+                             headers={"Accept":"application/json","User-Agent":"binfapp/1.11.0"})
             if r.status_code != 200: last_e = f"status {r.status_code}"; continue
             ct = (r.headers.get("content-type") or "").lower()
             if "application/json" not in ct and not ("/klines" in full or "/candles" in full):
@@ -78,20 +74,19 @@ def http_json(url: str, params=None, timeout=8, allow_worker=False):
     raise RuntimeError(f"http_json failed: {last_e}")
 
 def http_text(url: str, timeout=8):
-    r = requests.get(url, timeout=timeout, headers={"User-Agent":"binfapp/1.10.4"}); r.raise_for_status()
+    r = requests.get(url, timeout=timeout, headers={"User-Agent":"binfapp/1.11.0"}); r.raise_for_status()
     return r.text
 
-# ========= DYNAMIC UNIVERSE (Top-N by mcap) =========
+# ========= DYNAMIC UNIVERSE =========
 TOPN_DEFAULT = 10
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _discover_top_coins(top_n: int = TOPN_DEFAULT, _seed=None):
-    """Return list of base tickers like ['BTC','ETH', ...] using CoinGecko."""
     try:
         j = requests.get(
             "https://api.coingecko.com/api/v3/coins/markets",
             params={"vs_currency": "usd", "order": "market_cap_desc", "per_page": 60, "page": 1},
-            timeout=8, headers={"Accept":"application/json","User-Agent":"binfapp/1.10.4"}
+            timeout=8, headers={"Accept":"application/json","User-Agent":"binfapp/1.11.0"}
         ).json()
         bases = []
         for it in j:
@@ -111,7 +106,6 @@ def _discover_top_coins(top_n: int = TOPN_DEFAULT, _seed=None):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _binance_futures_universe(candidates: list[str], _seed=None):
-    """Filter to symbols that exist as USDT perps on Binance Futures."""
     try:
         ex = http_json(f"{FAPI_BASES[0]}/fapi/v1/exchangeInfo", timeout=10, allow_worker=bool(CF_WORKER_DEFAULT))
         syms = ex.get("symbols", []) if isinstance(ex, dict) else []
@@ -152,7 +146,7 @@ if "BTCUSDT" in SYMBOLS:
 
 st.sidebar.caption(f"Universe: {', '.join([_base_from_symbol(s) for s in SYMBOLS[:10]])}{'…' if len(SYMBOLS)>10 else ''}")
 
-symbol = st.sidebar.selectbox("Symbol", SYMBOLS, index=0, help="Binance USDT perpetual/spot-compatible symbol.")
+symbol = st.sidebar.selectbox("Symbol", SYMBOLS, index=0)
 report_url = st.sidebar.text_input("GitHub Pages report.json (debug)", value=REPORT_URL_DEFAULT)
 cf_worker = st.sidebar.text_input("Cloudflare Worker (optional)", value=CF_WORKER_DEFAULT)
 overlay_plan = st.sidebar.checkbox("Draw Plan A/B on chart (1h)", value=True)
@@ -163,8 +157,6 @@ refresh_seed = None
 if auto_refresh:
     refresh_seed = int(time.time() // 60)
     st.markdown("<script>setTimeout(function(){location.reload();}, 60000);</script>", unsafe_allow_html=True)
-
-st.sidebar.caption("Prices: Binance→OKX→Coinbase. FR/OI: Binance→OKX. Worker, if set, proxies Binance.")
 
 # ========= DATA HELPERS =========
 def _to_df_binance(raw):
@@ -312,21 +304,21 @@ def kpretty(x):
     try: return f"{x:,.2f}"
     except Exception: return str(x)
 
-# === RV one-liner (no jargon) ===
+# === RV one-liner ===
 def rv_one_liner(rv20: float, rv60: float) -> str:
     ratio = (rv20 / max(rv60, 1e-9))
     if ratio >= 1.15:
-        skew = "short-term volatility is rising vs medium-term (momentum bias; use wider stops)"
+        skew = "short-term volatility is rising vs medium-term (momentum bias; use wider stops)."
     elif ratio <= 0.85:
-        skew = "short-term volatility is cooling vs medium-term (mean-reversion bias; tighter stops ok)"
+        skew = "short-term volatility is cooling vs medium-term (mean-reversion bias; tighter stops ok)."
     else:
-        skew = "short- and medium-term volatility are aligned (no strong vol edge)"
+        skew = "short- and medium-term volatility are aligned (no strong vol edge)."
     hi = max(rv20, rv60)
     if   hi >= 100: level = "very high"
     elif hi >= 70:  level = "high"
     elif hi >= 40:  level = "moderate"
     else:           level = "calm"
-    return f"Volatility is <b>{level}</b>; {skew}."
+    return f"Volatility is {level}; {skew}"
 
 # ========= CORE LOAD =========
 @st.cache_data(ttl=60, show_spinner=False)
@@ -347,11 +339,20 @@ except Exception as e:
 df_1h, src_chart = tf_data["1h"]
 last_closed_bar_time = df_1h["ts"].iloc[-1]
 last_close = float(df_1h["close"].iloc[-1])
-st.caption(f"Prices: **{src_chart}**  ·  Worker: {'ON' if cf_worker else 'OFF'}")
 
-# ========= SIGNALS & aggregate =========
+# === Header captions ===
+st.caption(f"Prices: **{src_chart}** · Worker: {'ON' if cf_worker else 'OFF'}")
+s_1h = df_1h.set_index("ts")["close"]
+rv20_1h = realized_vol_series(s_1h, 20).iloc[-1] * 100
+rv60_1h = realized_vol_series(s_1h, 60).iloc[-1] * 100
+# << moved up
+st.caption("Using last CLOSED 1h bar (no repaint). Current 1h bar is excluded until it closes.")
+st.caption(rv_one_liner(rv20_1h, rv60_1h))
+
+# === Hero metrics ===
+cA, cB, cC, cD = st.columns([1.2,1.2,1.2,1.2])
+# aggregate regime from TFs
 signals = {tf: trend_flags(tf_data[tf][0]) for tf in TFS}
-
 def aggregate_regime(signals: dict):
     ups = downs = sides = 0; strong = 0
     for tf, s in signals.items():
@@ -363,41 +364,16 @@ def aggregate_regime(signals: dict):
     label = "Trend ↑" if ups >= max(downs,sides) and ups >= 2 else ("Trend ↓" if downs >= max(ups,sides) and downs >= 2 else "Sideways")
     conf = "high" if strong >= 3 else ("medium" if strong == 2 else "low")
     return {"label": label, "conf": conf, "ups": ups, "downs": downs, "sides": sides}
-
 agg = aggregate_regime(signals)
 
-# Top metrics (1h)
-s_1h = df_1h.set_index("ts")["close"]
-rv20_1h = realized_vol_series(s_1h, 20).iloc[-1] * 100
-rv60_1h = realized_vol_series(s_1h, 60).iloc[-1] * 100
-
-# Row 1 tiles
-cA, cB, cC, cD = st.columns([1.2,1.2,1.2,1.2])
 cA.metric("Regime (aggregate)", f"{agg['label']}", f"conf: {agg['conf']}")
 cB.metric("Last Close (1h)", kpretty(last_close), last_closed_bar_time.strftime("%Y-%m-%d %H:%M UTC"))
 cC.metric("RV20% (1h, annualized)", f"{rv20_1h:0.1f}%")
 cD.metric("RV60% (1h, annualized)", f"{rv60_1h:0.1f}%")
 
-# Row 2: keep left wide; right holds both info cards stacked — avoids layout gaps
-col_left, col_right = st.columns([2.6, 1.4])
-
-with col_right:
-    # RV explainer card
-    st.markdown(
-        f"""
-<div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;margin:2px 0 8px 0;">
-  <div style="font-size:0.95rem;color:#374151;">{rv_one_liner(rv20_1h, rv60_1h)}</div>
-</div>
-""",
-        unsafe_allow_html=True
-    )
-
-st.caption("Using **last CLOSED** 1h bar (no repaint). Current 1h bar is excluded until it closes.")
-
-# ========= Universe snapshot (Top-N vitals, richer) =========
+# ========= TOP-N SNAPSHOT (table) =========
 @st.cache_data(ttl=180, show_spinner=False)
 def _symbol_vitals(symbol: str):
-    """Lightweight per-symbol vitals from 1h bars only."""
     try:
         df1h, _ = get_klines_df(symbol, "1h", limit=300)
         df1h = drop_unclosed(df1h, "1h")
@@ -415,24 +391,39 @@ def _symbol_vitals(symbol: str):
     except Exception:
         return {"ok": False}
 
+def _level_note_rv(x: float) -> str:
+    if x >= 100: return "very high"
+    if x >= 70:  return "high"
+    if x >= 40:  return "moderate"
+    return "calm"
+
+def _note_adx(x: float) -> str:
+    if x >= 28: return "strong trend"
+    if x >= 22: return "building trend"
+    return "low trend strength"
+
+def _note_rsi(x: float) -> str:
+    if x >= 70: return "overbought-ish"
+    if x <= 30: return "oversold-ish"
+    return "neutral"
+
 def _universe_guide(avg20, avg60, breadth_pct, ups, downs, mom_breadth):
-    # clear, actionable one-liner
-    level = "calm" if max(avg20, avg60) < 40 else ("high" if max(avg20, avg60) >= 70 else "moderate")
+    level = _level_note_rv(max(avg20, avg60))
     bias = "up" if ups > downs else ("down" if downs > ups else "mixed")
     skew_ratio = avg20 / max(avg60, 1e-9)
     if skew_ratio >= 1.15:
-        skew = "short-term vol > medium-term (expanding — momentum entries hold better)"
+        skew = "vol expanding short-term → momentum entries hold better"
     elif skew_ratio <= 0.85:
-        skew = "short-term vol < medium-term (cooling — mean-reversion entries work better)"
+        skew = "vol cooling short-term → mean-reversion entries work better"
     else:
-        skew = "short-term ≈ medium-term (balanced volatility profile)"
+        skew = "vol profile balanced"
     if breadth_pct >= 60 and mom_breadth >= 55 and bias == "up":
-        action = "Prefer LONGs on pullbacks."
+        action = "prefer LONGs on pullbacks"
     elif breadth_pct <= 40 and mom_breadth <= 45 and bias == "down":
-        action = "Prefer SHORTs on bounces."
+        action = "prefer SHORTs on bounces"
     else:
-        action = "Keep size moderate; trade both sides around levels."
-    return f"Universe is **{level}**, bias **{bias}**; {skew} {action}"
+        action = "trade both sides; keep size moderate"
+    return f"Market level: {level}; bias: {bias}; {skew}; {action}"
 
 @st.cache_data(ttl=180, show_spinner=False)
 def universe_snapshot(symbols: list[str], max_symbols: int = 12, _seed=None):
@@ -441,8 +432,7 @@ def universe_snapshot(symbols: list[str], max_symbols: int = 12, _seed=None):
     for s in syms:
         v = _symbol_vitals(s)
         if v.get("ok"): rows.append((s, v))
-    if not rows:
-        return None
+    if not rows: return None
 
     rv20s = [v["rv20"] for _, v in rows]
     rv60s = [v["rv60"] for _, v in rows]
@@ -452,61 +442,53 @@ def universe_snapshot(symbols: list[str], max_symbols: int = 12, _seed=None):
     adx_vals = [v["adx14"] for _, v in rows]
     rsi_vals = [v["rsi14"] for _, v in rows]
 
-    avg20 = float(np.mean(rv20s)) if rv20s else float("nan")
-    avg60 = float(np.mean(rv60s)) if rv60s else float("nan")
-    med20 = float(np.median(rv20s)) if rv20s else float("nan")
-    med60 = float(np.median(rv60s)) if rv60s else float("nan")
+    avg20 = float(np.mean(rv20s)); avg60 = float(np.mean(rv60s))
+    med20 = float(np.median(rv20s)); med60 = float(np.median(rv60s))
     ups = sum(1 for x in labels if x == "Trend ↑")
     downs = sum(1 for x in labels if x == "Trend ↓")
     sides = sum(1 for x in labels if x == "Sideways")
     breadth = 100.0 * above / max(1, len(rows))
     mom_breadth = 100.0 * mom_bull / max(1, len(rows))
-    adx_avg = float(np.mean(adx_vals)) if adx_vals else float("nan")
-    rsi_avg = float(np.mean(rsi_vals)) if rsi_vals else float("nan")
-
+    adx_avg = float(np.mean(adx_vals))
+    rsi_avg = float(np.mean(rsi_vals))
     guide = _universe_guide(avg20, avg60, breadth, ups, downs, mom_breadth)
 
     return {
         "n": len(rows),
         "avg20": avg20, "avg60": avg60, "med20": med20, "med60": med60,
         "ups": ups, "downs": downs, "sides": sides,
-        "breadth": breadth,
-        "mom_breadth": mom_breadth,
+        "breadth": breadth, "mom_breadth": mom_breadth,
         "adx_avg": adx_avg, "rsi_avg": rsi_avg,
         "guide": guide
     }
 
 snap = universe_snapshot(SYMBOLS, max_symbols=topn, _seed=(refresh_seed if auto_refresh else None))
 
-with col_right:
-    if snap:
-        st.markdown(
-            f"""
-<div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;padding:12px;">
-  <div style="display:flex;justify-content:space-between;align-items:center;">
-    <div style="font-weight:600;">Top-N snapshot (N={snap['n']})</div>
-    <div style="font-size:12px;color:#6b7280;">{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC</div>
-  </div>
-  <div style="margin-top:6px;display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-    <div><span style="color:#6b7280;">Avg RV20:</span> <b>{snap['avg20']:.1f}%</b></div>
-    <div><span style="color:#6b7280;">Avg RV60:</span> <b>{snap['avg60']:.1f}%</b></div>
-    <div><span style="color:#6b7280;">Median RV20:</span> <b>{snap['med20']:.1f}%</b></div>
-    <div><span style="color:#6b7280;">Median RV60:</span> <b>{snap['med60']:.1f}%</b></div>
-    <div><span style="color:#6b7280;">Breadth (above 1h EMA200):</span> <b>{snap['breadth']:.0f}%</b></div>
-    <div><span style="color:#6b7280;">Momentum breadth (MACD>signal):</span> <b>{snap['mom_breadth']:.0f}%</b></div>
-    <div><span style="color:#6b7280;">Regime votes:</span> <b>↑ {snap['ups']}</b> / <b>↓ {snap['downs']}</b> / <b>↔ {snap['sides']}</b></div>
-    <div><span style="color:#6b7280;">Avg ADX14 (trend strength):</span> <b>{snap['adx_avg']:.1f}</b></div>
-    <div><span style="color:#6b7280;">Avg RSI14:</span> <b>{snap['rsi_avg']:.1f}</b></div>
-  </div>
-  <div style="margin-top:8px;color:#374151;">{snap['guide']}</div>
-</div>
-""",
-            unsafe_allow_html=True
-        )
-    else:
-        st.info("Top-N snapshot: not available (rate limited or providers busy).")
+# ========= MID SECTION: 2-cell layout =========
+left, spacer, right = st.columns([1.6, 0.06, 1.0])
 
-# ========= Funding & OI =========
+# ---- LEFT: Narrative & Decision ----
+def narrative_story(agg, signals, funding_level, funding_side, fund_mean_24h, news_risk):
+    s1h, s4h, sd = signals["1h"], signals["4h"], signals["1d"]
+    lines = []
+    if agg["label"] == "Trend ↑": lines.append("Tone: buyers have the ball; most frames lean up.")
+    elif agg["label"] == "Trend ↓": lines.append("Tone: sellers in control; bounces meet supply.")
+    else: lines.append("Tone: balanced — chop until a clean break sticks.")
+    lines.append("Daily vs EMA200: " + ("above (long bias)" if sd["price_vs_ema200"]=="above" else "below (short bias)"))
+    lines.append("4h alignment: " + ("EMA20>EMA50 (trend aligned)" if signals["4h"]["ema20_cross_50"]=="bull" else "EMA20<EMA50 (not aligned)"))
+    lines.append("1h momentum: " + ("MACD>signal (up)" if s1h["macd_cross"]=="bull" else "MACD<signal (down)"))
+    if s1h["rsi14"] >= 70 or s4h["rsi14"] >= 70: lines.append("RSI hot on intraday → prefer entries after a pause.")
+    if s1h["rsi14"] <= 30 or s4h["rsi14"] <= 30: lines.append("RSI cold → avoid chasing breakdowns; wait for a bounce.")
+    if funding_level in ("elevated","extreme"):
+        lines.append(f"Funding {funding_level}: {funding_side.lower()} — better to enter on pullbacks/pops, not chases.")
+    if fund_mean_24h is not None:
+        tilt = "longs pay" if fund_mean_24h>0 else ("shorts pay" if fund_mean_24h<0 else "flat")
+        lines.append(f"24h mean funding: {fund_mean_24h*100:.3f}%/8h ({tilt}).")
+    if news_risk == "elevated":
+        lines.append("Headline risk up — keep size smaller or wait 30–60m after news.")
+    return lines
+
+# funding & news (needed for narrative)
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_funding(symbol: str, limit: int = 48, _seed=None):
     try:
@@ -556,12 +538,10 @@ def fetch_open_interest(symbol: str, _seed=None):
         return None, "none"
 
 fdf, fsrc = fetch_funding(symbol, limit=48, _seed=(refresh_seed if auto_refresh else None))
-odf, osrc = fetch_open_interest(symbol, _seed=(refresh_seed if auto_refresh else None))
 last_funding = float(fdf["fundingRate"].iloc[-1]) if isinstance(fdf, pd.DataFrame) and not fdf.empty else None
-funding_str, funding_level, funding_side = funding_tilt(last_funding)
+funding_str, funding_level, funding_side = (funding_tilt(last_funding) if last_funding is not None else ("n/a","neutral","Flat"))
 fund_mean_24h = float(fdf["fundingRate"].tail(3).mean()) if isinstance(fdf, pd.DataFrame) and len(fdf) >= 3 else None
 
-# ========= News (24h, per coin) =========
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_news(feeds: list[str], lookback_hours: int = 24, max_items: int = 8, term: str = "Bitcoin", _seed=None):
     out = []; cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
@@ -597,30 +577,64 @@ news_items = fetch_news(NEWS_FEEDS, NEWS_LOOKBACK_HOURS, 8, term=_news_term(symb
                         _seed=(refresh_seed if auto_refresh else None))
 news_risk = "elevated" if news_items and any(re.search(r"(hack|exploit|liquidat|halt|delay|lawsuit|ban|shutdown|outage|security|CPI|rate)", n["title"], flags=re.I) for n in news_items[:5]) else "normal"
 
-# ========= Narrative =========
-def narrative_story(agg, signals, funding_level, funding_side, fund_mean_24h, news_risk):
-    s1h, s4h, sd = signals["1h"], signals["4h"], signals["1d"]
-    lines = []
-    if agg["label"] == "Trend ↑": lines.append("**Tone:** buyers have the ball; most frames lean up.")
-    elif agg["label"] == "Trend ↓": lines.append("**Tone:** sellers in control; bounces meet supply.")
-    else: lines.append("**Tone:** balanced — chop until a clean break sticks.")
-    lines.append("**Daily** " + ("above" if sd["price_vs_ema200"]=="above" else "below") + " long trend (EMA200).")
-    lines.append("**4h** " + ("aligned (EMA20>EMA50)" if signals["4h"]["ema20_cross_50"]=="bull" else "not aligned (EMA20<EMA50)"))
-    lines.append("**1h momentum** " + ("up (MACD>signal)" if s1h["macd_cross"]=="bull" else "down (MACD<signal)"))
-    if s1h["rsi14"] >= 70 or s4h["rsi14"] >= 70: lines.append("RSI is **hot** on intraday → prefer entries after a pause.")
-    if s1h["rsi14"] <= 30 or s4h["rsi14"] <= 30: lines.append("RSI is **cold** → avoid chasing breakdowns; wait for a bounce.")
-    if funding_level in ("elevated","extreme"):
-        lines.append(f"Funding **{funding_level}**: {funding_side.lower()} — better to enter on pullbacks/pops, not chases.")
-    if fund_mean_24h is not None:
-        tilt = "longs pay" if fund_mean_24h>0 else ("shorts pay" if fund_mean_24h<0 else "flat")
-        lines.append(f"24h mean funding: **{fund_mean_24h*100:.3f}%/8h** ({tilt}).")
-    if news_risk == "elevated":
-        lines.append("**Headline risk up** — keep size smaller or wait 30–60m after news.")
-    return lines
+with left:
+    st.subheader("Narrative & decision (multi-TF synthesis)")
+    st.markdown(
+        f"Aggregate Regime: **{agg['label']}** (confidence: *{agg['conf']}*) · TF votes — ↑:{agg['ups']} / ↓:{agg['downs']} / ↔:{agg['sides']}"
+    )
+    tale_lines = narrative_story(agg, signals, funding_level, funding_side, fund_mean_24h, news_risk)
+    st.markdown("\n".join([f"- {ln}" for ln in tale_lines]))
 
-tale_lines = narrative_story(agg, signals, funding_level, funding_side, fund_mean_24h, news_risk)
+# ---- RIGHT: Top-N table with notes ----
+with right:
+    if snap:
+        now_utc = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+        # build rows: (param, value, note)
+        rows = [
+            ("Avg RV20", f"{snap['avg20']:.1f}%", _level_note_rv(snap['avg20'])),
+            ("Avg RV60", f"{snap['avg60']:.1f}%", _level_note_rv(snap['avg60'])),
+            ("Median RV20", f"{snap['med20']:.1f}%", ""),
+            ("Median RV60", f"{snap['med60']:.1f}%", ""),
+            ("Breadth (above 1h EMA200)", f"{snap['breadth']:.0f}%", "higher = broader uptrend"),
+            ("Momentum breadth (MACD>signal)", f"{snap['mom_breadth']:.0f}%", "higher = more coins with bullish momentum"),
+            ("Regime votes", f"↑ {snap['ups']} / ↓ {snap['downs']} / ↔ {snap['sides']}", "bias from up vs down counts"),
+            ("Avg ADX14 (trend strength)", f"{snap['adx_avg']:.1f}", _note_adx(snap['adx_avg'])),
+            ("Avg RSI14", f"{snap['rsi_avg']:.1f}", _note_rsi(snap['rsi_avg'])),
+            ("Universe guide", "", snap['guide'])
+        ]
+        # HTML table
+        table_html = [
+            f"""
+<div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;padding:12px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+    <div style="font-weight:600;">Top-N snapshot (N={snap['n']})</div>
+    <div style="font-size:12px;color:#6b7280;">{now_utc}</div>
+  </div>
+  <table style="width:100%;border-collapse:collapse;">
+    <thead>
+      <tr>
+        <th style="text-align:left;border-bottom:1px solid #e5e7eb;padding:6px 4px;color:#6b7280;width:46%;">Parameter</th>
+        <th style="text-align:left;border-bottom:1px solid #e5e7eb;padding:6px 4px;color:#6b7280;width:22%;">Value</th>
+        <th style="text-align:left;border-bottom:1px solid #e5e7eb;padding:6px 4px;color:#6b7280;width:32%;">Note / dynamics</th>
+      </tr>
+    </thead>
+    <tbody>
+"""
+        ]
+        for p, v, n in rows:
+            table_html.append(
+                f"""<tr>
+<td style="padding:6px 4px;border-bottom:1px solid #f1f5f9;">{p}</td>
+<td style="padding:6px 4px;border-bottom:1px solid #f1f5f9;">{v}</td>
+<td style="padding:6px 4px;border-bottom:1px solid #f1f5f9;color:#374151;">{n}</td>
+</tr>"""
+            )
+        table_html.append("</tbody></table></div>")
+        st.markdown("\n".join(table_html), unsafe_allow_html=True)
+    else:
+        st.info("Top-N snapshot not available (providers busy).")
 
-# ========= Plans (1h) =========
+# ========= PLAN A/B (kept below mid-section) =========
 def swing_levels(df, lookback=30):
     highs = df["high"].tail(lookback); lows = df["low"].tail(lookback)
     return float(highs.max()), float(lows.min())
@@ -650,15 +664,9 @@ def plan_levels(df_1h, regime_up: bool):
 regime_is_up = (agg["label"] == "Trend ↑")
 plan = plan_levels(df_1h.copy(), regime_is_up)
 
-st.subheader("Narrative & decision (multi-TF synthesis)")
-st.markdown(
-    f"**Aggregate Regime:** **{agg['label']}** (confidence: *{agg['conf']}*) · TF votes — ↑:{agg['ups']} / ↓:{agg['downs']} / ↔:{agg['sides']}  \n"
-    f"**Funding tilt:** *{funding_str}* — *{funding_level}*, **{funding_side}** · **News risk:** *{news_risk}*"
-)
-st.markdown("\n".join([f"- {ln}" for ln in tale_lines]))
-st.markdown(f"**{plan['note']}**  \n*Plan B:* {plan['alt']}")
+st.markdown(f"**{plan['note']}**  \n*Alternative:* {plan['alt']}")
 
-# ========= Matrix =========
+# ========= MATRIX =========
 def tf_row(tframe):
     df2, _ = tf_data[tframe]
     s2 = signals[tframe]
@@ -715,25 +723,11 @@ styled = (
 )
 st.dataframe(styled, use_container_width=True)
 
-with st.expander("Legend", expanded=False):
-    st.markdown(
-        """
-- **ema200_dir** — above/below EMA200 (big-picture bias).  
-- **ema20>50, macd, rsi>ma5** — alignment of short-term trend, momentum, RSI direction (✓ good, × opposite).  
-- **rsi / rsi_ma5** — RSI(14) and its 5-bar average (green ≤30, red ≥70).  
-- **adx** — trend strength (**high ≥28**, **medium 22–28**, **low <22**).  
-- **rv20%** — annualized realized volatility from last 20 bars of that TF.  
-- **recommend** — per-TF action: **Buy dips / Sell rips / Range trade**.  
-- Using **last CLOSED** bar on each TF to avoid repaint.
-        """.strip()
-    )
-
-# ========= CHART (1h) =========
+# ========= CHART =========
 with st.expander("Chart (1h)", expanded=True):
     df = df_1h.copy()
     x_ts = df["ts"]; close_s = df["close"]
     ema20s, ema50s, ema200s = ema(close_s,20), ema(close_s,50), ema(close_s,200)
-
     if not PLOTLY:
         st.line_chart(close_s.set_axis(x_ts), use_container_width=True)
     else:
@@ -761,35 +755,22 @@ with st.expander("Chart (1h)", expanded=True):
         fig.update_layout(height=520, margin=dict(l=10,r=10,t=30,b=10), xaxis_rangeslider_visible=False)
         st.plotly_chart(fig, use_container_width=True)
 
-# ========= Funding & OI =========
+# ========= Funding, OI & News =========
 with st.expander("Funding & Open Interest (Futures context)"):
-    fcol, ocol = st.columns(2)
     try:
         if isinstance(fdf, pd.DataFrame) and not fdf.empty:
-            last_f = fdf["fundingRate"].iloc[-1]*100
-            fcol.metric(f"Last funding ({fsrc})", f"{last_f:.4f}% / 8h")
+            st.metric(f"Last funding ({fsrc})", f"{fdf['fundingRate'].iloc[-1]*100:.4f}% / 8h")
             if fund_mean_24h is not None:
-                fcol.caption(f"24h mean: {fund_mean_24h*100:.4f}% / 8h  ·  bias: {'longs pay' if fund_mean_24h>0 else ('shorts pay' if fund_mean_24h<0 else 'flat')}")
-            fcol.line_chart(fdf.set_index("fundingTime")["fundingRate"]*100, height=160)
+                st.caption(f"24h mean: {fund_mean_24h*100:.4f}% / 8h  ·  bias: {'longs pay' if fund_mean_24h>0 else ('shorts pay' if fund_mean_24h<0 else 'flat')}")
+            st.line_chart(fdf.set_index("fundingTime")["fundingRate"]*100, height=160)
         else:
-            fcol.info("No funding data.")
+            st.info("No funding data.")
     except Exception as e:
-        fcol.warning(f"Funding error: {e}")
+        st.warning(f"Funding error: {e}")
 
-    try:
-        if isinstance(odf, pd.DataFrame) and not odf.empty:
-            ocol.metric(f"Open interest ({osrc})", f"{float(odf['oi'].iloc[-1]):,.0f}")
-            ocol.caption("Snapshot only (no public OI history in this view).")
-        else:
-            ocol.info("No OI data.")
-    except Exception as e:
-        ocol.warning(f"OI error: {e}")
-
-# ========= NEWS =========
 with st.expander("News (last 24h)", expanded=False):
-    items = news_items
-    if items:
-        for n in items:
+    if news_items:
+        for n in news_items:
             ts = n["ts"].strftime("%Y-%m-%d %H:%M UTC")
             st.markdown(f"- [{n['title']}]({n['link']})  —  *{ts}*")
     else:
@@ -811,7 +792,7 @@ if report_url:
 
 if payload:
     with st.expander("report.json — raw & pivot (debug)", expanded=False):
-        if payload.get("stale"): st.warning("report.json is **STALE**; charts use live klines.")
+        if payload.get("stale"): st.warning("report.json is STALE; charts use live klines.")
         rows = payload.get("data", []); dfj = pd.json_normalize(rows)
         if not dfj.empty:
             st.dataframe(dfj, use_container_width=True)
