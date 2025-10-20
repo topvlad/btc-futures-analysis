@@ -1,6 +1,7 @@
-# streamlit_app.py — v1.10.2
+# streamlit_app.py — v1.10.3
 # Top-N crypto dashboard (CoinGecko → Binance USDT-perps), regime & RVs, Plan A/B, chart overlays.
-# v1.10.2: Adds concise dynamic explainer for RV20/RV60 right under the tiles.
+# v1.10.2: RV one-liner
+# v1.10.3: right-aligned RV explainer card + Top-N "Universe snapshot" tile under RVs
 
 import os, json, math, time, re, requests, pandas as pd, numpy as np
 import streamlit as st
@@ -65,7 +66,7 @@ def http_json(url: str, params=None, timeout=8, allow_worker=False):
     for label, full, p in attempts:
         try:
             r = requests.get(full, params=None if label=="WORKER" else p, timeout=timeout,
-                             headers={"Accept":"application/json","User-Agent":"binfapp/1.10.2"})
+                             headers={"Accept":"application/json","User-Agent":"binfapp/1.10.3"})
             if r.status_code != 200: last_e = f"status {r.status_code}"; continue
             ct = (r.headers.get("content-type") or "").lower()
             if "application/json" not in ct and not ("/klines" in full or "/candles" in full):
@@ -76,7 +77,7 @@ def http_json(url: str, params=None, timeout=8, allow_worker=False):
     raise RuntimeError(f"http_json failed: {last_e}")
 
 def http_text(url: str, timeout=8):
-    r = requests.get(url, timeout=timeout, headers={"User-Agent":"binfapp/1.10.2"}); r.raise_for_status()
+    r = requests.get(url, timeout=timeout, headers={"User-Agent":"binfapp/1.10.3"}); r.raise_for_status()
     return r.text
 
 # ========= DYNAMIC UNIVERSE (Top-N by mcap) =========
@@ -89,14 +90,14 @@ def _discover_top_coins(top_n: int = TOPN_DEFAULT, _seed=None):
         j = requests.get(
             "https://api.coingecko.com/api/v3/coins/markets",
             params={"vs_currency": "usd", "order": "market_cap_desc", "per_page": 60, "page": 1},
-            timeout=8, headers={"Accept":"application/json","User-Agent":"binfapp/1.10.2"}
+            timeout=8, headers={"Accept":"application/json","User-Agent":"binfapp/1.10.3"}
         ).json()
         bases = []
         for it in j:
             sym = (it.get("symbol") or "").upper().strip()
             if sym in ("USDT","USDC","FDUSD","TUSD","DAI","USDD","USDE","PYUSD"):
                 continue
-            sym = {"XBT":"BTC","WETH":"ETH"}.get(sym, sym)  # rare remaps
+            sym = {"XBT":"BTC","WETH":"ETH"}.get(sym, sym)
             bases.append(sym)
         seen, uniq = set(), []
         for b in bases:
@@ -118,11 +119,9 @@ def _binance_futures_universe(candidates: list[str], _seed=None):
                       and s.get("status") == "TRADING"
                       and s.get("contractType","PERPETUAL").upper() in ("PERPETUAL","CURRENT_QUARTER","NEXT_QUARTER")}
         out = []
-        base_map = {
-            "IOTA":"IOTA","WBTC":"BTC","BCH":"BCH","TON":"TON","SHIB":"SHIB",
-            "MATIC":"MATIC","PEPE":"PEPE","SUI":"SUI","APT":"APT","ARB":"ARB",
-            "AVAX":"AVAX","LTC":"LTC","DOT":"DOT","LINK":"LINK",
-        }
+        base_map = {"IOTA":"IOTA","WBTC":"BTC","BCH":"BCH","TON":"TON","SHIB":"SHIB",
+                    "MATIC":"MATIC","PEPE":"PEPE","SUI":"SUI","APT":"APT","ARB":"ARB",
+                    "AVAX":"AVAX","LTC":"LTC","DOT":"DOT","LINK":"LINK"}
         for base in candidates:
             b = base_map.get(base, base)
             cand = f"{b}USDT"
@@ -132,10 +131,9 @@ def _binance_futures_universe(candidates: list[str], _seed=None):
     except Exception:
         return [f"{b}USDT" for b in ["BTC","ETH","BNB","SOL","XRP","ADA","DOGE","TON","TRX","LINK"]]
 
-# ========= SIDEBAR (universe controls first) =========
+# ========= SIDEBAR =========
 st.sidebar.header("Data & Options")
 
-# Universe controls + seed for manual refresh
 topn = st.sidebar.number_input("Universe size (Top-N by market cap)", min_value=5, max_value=30,
                                value=TOPN_DEFAULT, step=1,
                                help="Coins from CoinGecko top market caps, filtered to Binance USDT perps.")
@@ -144,19 +142,15 @@ if "universe_seed" not in st.session_state:
 if st.sidebar.button("↻ Refresh universe now", help="Force refresh of the Top-N list (bypass 1h cache)."):
     st.session_state.universe_seed = int(time.time())
 
-# Build the dynamic universe using the seed for cache keys
 bases = _discover_top_coins(topn, _seed=st.session_state.universe_seed)
 SYMBOLS = _binance_futures_universe(bases, _seed=st.session_state.universe_seed)
 if not SYMBOLS:
-    SYMBOLS = ["BTCUSDT","ETHUSDT"]  # safety fallback
-# Ensure BTC first if present
+    SYMBOLS = ["BTCUSDT","ETHUSDT"]
 if "BTCUSDT" in SYMBOLS:
     SYMBOLS.remove("BTCUSDT"); SYMBOLS.insert(0, "BTCUSDT")
 
-# Universe badge
 st.sidebar.caption(f"Universe: {', '.join([_base_from_symbol(s) for s in SYMBOLS[:10]])}{'…' if len(SYMBOLS)>10 else ''}")
 
-# Rest of options
 symbol = st.sidebar.selectbox("Symbol", SYMBOLS, index=0, help="Binance USDT perpetual/spot-compatible symbol.")
 report_url = st.sidebar.text_input("GitHub Pages report.json (debug)", value=REPORT_URL_DEFAULT)
 cf_worker = st.sidebar.text_input("Cloudflare Worker (optional)", value=CF_WORKER_DEFAULT)
@@ -164,10 +158,9 @@ overlay_plan = st.sidebar.checkbox("Draw Plan A/B on chart (1h)", value=True)
 extra_emas = st.sidebar.multiselect("Extra EMAs (on chart)", options=[100, 400, 800], default=[400])
 auto_refresh = st.sidebar.checkbox("Auto-refresh UI every 60s (uses last CLOSED bar; no repaint)", value=False)
 
-# Auto-refresh: client reload + cache seed
 refresh_seed = None
 if auto_refresh:
-    refresh_seed = int(time.time() // 60)  # changes once/min
+    refresh_seed = int(time.time() // 60)
     st.markdown("<script>setTimeout(function(){location.reload();}, 60000);</script>", unsafe_allow_html=True)
 
 st.sidebar.caption("Prices: Binance→OKX→Coinbase. FR/OI: Binance→OKX. Worker, if set, proxies Binance.")
@@ -318,13 +311,8 @@ def kpretty(x):
     try: return f"{x:,.2f}"
     except Exception: return str(x)
 
-# === NEW: one-sentence RV explainer ===
+# === RV one-liner (used in right card) ===
 def rv_one_liner(rv20: float, rv60: float) -> str:
-    """
-    Return a concise, single-sentence explanation of RV20/RV60 relationship and level.
-    rv20/rv60 are percents (e.g., 58.4).
-    """
-    # relative skew
     ratio = (rv20 / max(rv60, 1e-9))
     if ratio >= 1.15:
         skew = "short-term vol is rising vs trend (momentum bias; use wider stops)"
@@ -332,15 +320,12 @@ def rv_one_liner(rv20: float, rv60: float) -> str:
         skew = "short-term vol is cooling vs trend (mean-reversion bias; tighter stops ok)"
     else:
         skew = "short- and medium-term vol are aligned (no strong vol edge)"
-
-    # absolute regime from max of the two
     hi = max(rv20, rv60)
     if   hi >= 100: level = "very high"
     elif hi >= 70:  level = "high"
     elif hi >= 40:  level = "moderate"
     else:           level = "calm"
-
-    return f"Volatility is **{level}**; {skew}."
+    return f"Volatility is <b>{level}</b>; {skew}."
 
 # ========= CORE LOAD =========
 @st.cache_data(ttl=60, show_spinner=False)
@@ -359,7 +344,7 @@ except Exception as e:
 
 # Use 1h for chart & plan
 df_1h, src_chart = tf_data["1h"]
-last_closed_bar_time = df_1h["ts"].iloc[-1]  # guaranteed closed
+last_closed_bar_time = df_1h["ts"].iloc[-1]
 last_close = float(df_1h["close"].iloc[-1])
 st.caption(f"Prices: **{src_chart}**  ·  Worker: {'ON' if cf_worker else 'OFF'}")
 
@@ -384,16 +369,109 @@ agg = aggregate_regime(signals)
 s_1h = df_1h.set_index("ts")["close"]
 rv20_1h = realized_vol_series(s_1h, 20).iloc[-1] * 100
 rv60_1h = realized_vol_series(s_1h, 60).iloc[-1] * 100
+
+# Row 1 tiles
 cA, cB, cC, cD = st.columns([1.2,1.2,1.2,1.2])
 cA.metric("Regime (aggregate)", f"{agg['label']}", f"conf: {agg['conf']}")
 cB.metric("Last Close (1h)", kpretty(last_close), last_closed_bar_time.strftime("%Y-%m-%d %H:%M UTC"))
 cC.metric("RV20% (1h, annualized)", f"{rv20_1h:0.1f}%")
 cD.metric("RV60% (1h, annualized)", f"{rv60_1h:0.1f}%")
 
-# NEW: the one-liner goes directly under the tiles (before the closed-bar caption)
-st.markdown(f"<div style='margin-top:-6px; color:#6b7280;'>{rv_one_liner(rv20_1h, rv60_1h)}</div>", unsafe_allow_html=True)
+# Row 2: right-aligned RV explainer card + Top-N snapshot tile
+left_gap, right_side = st.columns([2.4, 2.4])
+
+with right_side:
+    st.markdown(
+        f"""
+<div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;margin:-6px 0 8px 0;">
+  <div style="font-size:0.95rem;color:#374151;">{rv_one_liner(rv20_1h, rv60_1h)}</div>
+</div>
+""",
+        unsafe_allow_html=True
+    )
 
 st.caption("Using **last CLOSED** 1h bar (no repaint). Current 1h bar is excluded until it closes.")
+
+# ========= Universe snapshot (Top-N vitals) =========
+@st.cache_data(ttl=180, show_spinner=False)
+def _symbol_vitals(symbol: str):
+    """Lightweight per-symbol vitals from 1h bars only."""
+    try:
+        df1h, _ = get_klines_df(symbol, "1h", limit=300)
+        df1h = drop_unclosed(df1h, "1h")
+        s = df1h.set_index("ts")["close"]
+        rv20 = float(realized_vol_series(s, 20).iloc[-1] * 100)
+        rv60 = float(realized_vol_series(s, 60).iloc[-1] * 100)
+        sig = trend_flags(df1h)
+        _, _, lab = regime_score(sig)
+        above200 = 1 if sig["price_vs_ema200"] == "above" else 0
+        return {"ok": True, "rv20": rv20, "rv60": rv60, "label": lab, "above200": above200}
+    except Exception:
+        return {"ok": False}
+
+@st.cache_data(ttl=180, show_spinner=False)
+def universe_snapshot(symbols: list[str], max_symbols: int = 12, _seed=None):
+    syms = symbols[:max_symbols]
+    rows = []
+    for s in syms:
+        v = _symbol_vitals(s)
+        if v.get("ok"): rows.append((s, v))
+    if not rows:
+        return None
+
+    rv20s = [v["rv20"] for _, v in rows]
+    rv60s = [v["rv60"] for _, v in rows]
+    labels = [v["label"] for _, v in rows]
+    above = sum(v["above200"] for _, v in rows)
+
+    avg20 = float(np.mean(rv20s)) if rv20s else float("nan")
+    avg60 = float(np.mean(rv60s)) if rv60s else float("nan")
+    ups = sum(1 for x in labels if x == "Trend ↑")
+    downs = sum(1 for x in labels if x == "Trend ↓")
+    sides = sum(1 for x in labels if x == "Sideways")
+    breadth = 100.0 * above / max(1, len(rows))
+
+    # universe one-liner
+    ratio = (avg20 / max(avg60, 1e-9))
+    if ratio >= 1.15:
+        skew = "ST vol > MT (expanding)"
+    elif ratio <= 0.85:
+        skew = "ST vol < MT (cooling)"
+    else:
+        skew = "ST≈MT (balanced)"
+
+    return {
+        "n": len(rows),
+        "avg20": avg20, "avg60": avg60,
+        "ups": ups, "downs": downs, "sides": sides,
+        "breadth": breadth,
+        "skew": skew
+    }
+
+snap = universe_snapshot(SYMBOLS, max_symbols=topn, _seed=(refresh_seed if auto_refresh else None))
+
+with right_side:
+    if snap:
+        st.markdown(
+            f"""
+<div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;padding:12px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;">
+    <div style="font-weight:600;">Top-N snapshot (N={snap['n']})</div>
+    <div style="font-size:12px;color:#6b7280;">{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC</div>
+  </div>
+  <div style="margin-top:6px;display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+    <div><span style="color:#6b7280;">Avg RV20:</span> <b>{snap['avg20']:.1f}%</b></div>
+    <div><span style="color:#6b7280;">Avg RV60:</span> <b>{snap['avg60']:.1f}%</b></div>
+    <div><span style="color:#6b7280;">Breadth (above 1h EMA200):</span> <b>{snap['breadth']:.0f}%</b></div>
+    <div><span style="color:#6b7280;">Regime votes:</span> <b>↑ {snap['ups']}</b> / <b>↓ {snap['downs']}</b> / <b>↔ {snap['sides']}</b></div>
+  </div>
+  <div style="margin-top:6px;color:#374151;">Skew: <b>{snap['skew']}</b></div>
+</div>
+""",
+            unsafe_allow_html=True
+        )
+    else:
+        st.info("Top-N snapshot: not available (rate limited or providers busy).")
 
 # ========= Funding & OI =========
 @st.cache_data(ttl=120, show_spinner=False)
