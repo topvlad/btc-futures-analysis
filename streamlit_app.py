@@ -578,10 +578,13 @@ news_items = fetch_news(NEWS_FEEDS, NEWS_LOOKBACK_HOURS, 8, term=_news_term(symb
 news_risk = "elevated" if news_items and any(re.search(r"(hack|exploit|liquidat|halt|delay|lawsuit|ban|shutdown|outage|security|CPI|rate)", n["title"], flags=re.I) for n in news_items[:5]) else "normal"
 
 with left:
-    st.subheader("Narrative & decision (multi-TF synthesis)")
+    st.subheader("Token Vitals (multi-TF analysis)")
     st.markdown(
-        f"Aggregate Regime: **{agg['label']}** (confidence: *{agg['conf']}*) · TF votes — ↑:{agg['ups']} / ↓:{agg['downs']} / ↔:{agg['sides']}"
+        f"Aggregate Regime: **{agg['label']}** (confidence: *{agg['conf']}*)<br>"
+        f"<span style='color:#6b7280'>TF votes — ↑:{agg['ups']} / ↓:{agg['downs']} / ↔:{agg['sides']}</span>",
+        unsafe_allow_html=True,
     )
+
     tale_lines = narrative_story(agg, signals, funding_level, funding_side, fund_mean_24h, news_risk)
     st.markdown("\n".join([f"- {ln}" for ln in tale_lines]))
 
