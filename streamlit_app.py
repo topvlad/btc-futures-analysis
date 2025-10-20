@@ -1,7 +1,8 @@
-# streamlit_app.py — v1.10.3
+# streamlit_app.py — v1.10.4
 # Top-N crypto dashboard (CoinGecko → Binance USDT-perps), regime & RVs, Plan A/B, chart overlays.
 # v1.10.2: RV one-liner
-# v1.10.3: right-aligned RV explainer card + Top-N "Universe snapshot" tile under RVs
+# v1.10.3: right-side RV card + Top-N snapshot
+# v1.10.4: layout fix, no jargon, richer Top-N stats & "Universe guide" suggestion
 
 import os, json, math, time, re, requests, pandas as pd, numpy as np
 import streamlit as st
@@ -66,7 +67,7 @@ def http_json(url: str, params=None, timeout=8, allow_worker=False):
     for label, full, p in attempts:
         try:
             r = requests.get(full, params=None if label=="WORKER" else p, timeout=timeout,
-                             headers={"Accept":"application/json","User-Agent":"binfapp/1.10.3"})
+                             headers={"Accept":"application/json","User-Agent":"binfapp/1.10.4"})
             if r.status_code != 200: last_e = f"status {r.status_code}"; continue
             ct = (r.headers.get("content-type") or "").lower()
             if "application/json" not in ct and not ("/klines" in full or "/candles" in full):
@@ -77,7 +78,7 @@ def http_json(url: str, params=None, timeout=8, allow_worker=False):
     raise RuntimeError(f"http_json failed: {last_e}")
 
 def http_text(url: str, timeout=8):
-    r = requests.get(url, timeout=timeout, headers={"User-Agent":"binfapp/1.10.3"}); r.raise_for_status()
+    r = requests.get(url, timeout=timeout, headers={"User-Agent":"binfapp/1.10.4"}); r.raise_for_status()
     return r.text
 
 # ========= DYNAMIC UNIVERSE (Top-N by mcap) =========
@@ -90,7 +91,7 @@ def _discover_top_coins(top_n: int = TOPN_DEFAULT, _seed=None):
         j = requests.get(
             "https://api.coingecko.com/api/v3/coins/markets",
             params={"vs_currency": "usd", "order": "market_cap_desc", "per_page": 60, "page": 1},
-            timeout=8, headers={"Accept":"application/json","User-Agent":"binfapp/1.10.3"}
+            timeout=8, headers={"Accept":"application/json","User-Agent":"binfapp/1.10.4"}
         ).json()
         bases = []
         for it in j:
@@ -311,15 +312,15 @@ def kpretty(x):
     try: return f"{x:,.2f}"
     except Exception: return str(x)
 
-# === RV one-liner (used in right card) ===
+# === RV one-liner (no jargon) ===
 def rv_one_liner(rv20: float, rv60: float) -> str:
     ratio = (rv20 / max(rv60, 1e-9))
     if ratio >= 1.15:
-        skew = "short-term vol is rising vs trend (momentum bias; use wider stops)"
+        skew = "short-term volatility is rising vs medium-term (momentum bias; use wider stops)"
     elif ratio <= 0.85:
-        skew = "short-term vol is cooling vs trend (mean-reversion bias; tighter stops ok)"
+        skew = "short-term volatility is cooling vs medium-term (mean-reversion bias; tighter stops ok)"
     else:
-        skew = "short- and medium-term vol are aligned (no strong vol edge)"
+        skew = "short- and medium-term volatility are aligned (no strong vol edge)"
     hi = max(rv20, rv60)
     if   hi >= 100: level = "very high"
     elif hi >= 70:  level = "high"
@@ -377,13 +378,14 @@ cB.metric("Last Close (1h)", kpretty(last_close), last_closed_bar_time.strftime(
 cC.metric("RV20% (1h, annualized)", f"{rv20_1h:0.1f}%")
 cD.metric("RV60% (1h, annualized)", f"{rv60_1h:0.1f}%")
 
-# Row 2: right-aligned RV explainer card + Top-N snapshot tile
-left_gap, right_side = st.columns([2.4, 2.4])
+# Row 2: keep left wide; right holds both info cards stacked — avoids layout gaps
+col_left, col_right = st.columns([2.6, 1.4])
 
-with right_side:
+with col_right:
+    # RV explainer card
     st.markdown(
         f"""
-<div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;margin:-6px 0 8px 0;">
+<div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;margin:2px 0 8px 0;">
   <div style="font-size:0.95rem;color:#374151;">{rv_one_liner(rv20_1h, rv60_1h)}</div>
 </div>
 """,
@@ -392,7 +394,7 @@ with right_side:
 
 st.caption("Using **last CLOSED** 1h bar (no repaint). Current 1h bar is excluded until it closes.")
 
-# ========= Universe snapshot (Top-N vitals) =========
+# ========= Universe snapshot (Top-N vitals, richer) =========
 @st.cache_data(ttl=180, show_spinner=False)
 def _symbol_vitals(symbol: str):
     """Lightweight per-symbol vitals from 1h bars only."""
@@ -405,9 +407,32 @@ def _symbol_vitals(symbol: str):
         sig = trend_flags(df1h)
         _, _, lab = regime_score(sig)
         above200 = 1 if sig["price_vs_ema200"] == "above" else 0
-        return {"ok": True, "rv20": rv20, "rv60": rv60, "label": lab, "above200": above200}
+        macd_bull = 1 if sig["macd_cross"] == "bull" else 0
+        adx14 = float(sig["adx14"])
+        rsi14 = float(sig["rsi14"])
+        return {"ok": True, "rv20": rv20, "rv60": rv60, "label": lab,
+                "above200": above200, "macd_bull": macd_bull, "adx14": adx14, "rsi14": rsi14}
     except Exception:
         return {"ok": False}
+
+def _universe_guide(avg20, avg60, breadth_pct, ups, downs, mom_breadth):
+    # clear, actionable one-liner
+    level = "calm" if max(avg20, avg60) < 40 else ("high" if max(avg20, avg60) >= 70 else "moderate")
+    bias = "up" if ups > downs else ("down" if downs > ups else "mixed")
+    skew_ratio = avg20 / max(avg60, 1e-9)
+    if skew_ratio >= 1.15:
+        skew = "short-term vol > medium-term (expanding — momentum entries hold better)"
+    elif skew_ratio <= 0.85:
+        skew = "short-term vol < medium-term (cooling — mean-reversion entries work better)"
+    else:
+        skew = "short-term ≈ medium-term (balanced volatility profile)"
+    if breadth_pct >= 60 and mom_breadth >= 55 and bias == "up":
+        action = "Prefer LONGs on pullbacks."
+    elif breadth_pct <= 40 and mom_breadth <= 45 and bias == "down":
+        action = "Prefer SHORTs on bounces."
+    else:
+        action = "Keep size moderate; trade both sides around levels."
+    return f"Universe is **{level}**, bias **{bias}**; {skew} {action}"
 
 @st.cache_data(ttl=180, show_spinner=False)
 def universe_snapshot(symbols: list[str], max_symbols: int = 12, _seed=None):
@@ -423,34 +448,37 @@ def universe_snapshot(symbols: list[str], max_symbols: int = 12, _seed=None):
     rv60s = [v["rv60"] for _, v in rows]
     labels = [v["label"] for _, v in rows]
     above = sum(v["above200"] for _, v in rows)
+    mom_bull = sum(v["macd_bull"] for _, v in rows)
+    adx_vals = [v["adx14"] for _, v in rows]
+    rsi_vals = [v["rsi14"] for _, v in rows]
 
     avg20 = float(np.mean(rv20s)) if rv20s else float("nan")
     avg60 = float(np.mean(rv60s)) if rv60s else float("nan")
+    med20 = float(np.median(rv20s)) if rv20s else float("nan")
+    med60 = float(np.median(rv60s)) if rv60s else float("nan")
     ups = sum(1 for x in labels if x == "Trend ↑")
     downs = sum(1 for x in labels if x == "Trend ↓")
     sides = sum(1 for x in labels if x == "Sideways")
     breadth = 100.0 * above / max(1, len(rows))
+    mom_breadth = 100.0 * mom_bull / max(1, len(rows))
+    adx_avg = float(np.mean(adx_vals)) if adx_vals else float("nan")
+    rsi_avg = float(np.mean(rsi_vals)) if rsi_vals else float("nan")
 
-    # universe one-liner
-    ratio = (avg20 / max(avg60, 1e-9))
-    if ratio >= 1.15:
-        skew = "ST vol > MT (expanding)"
-    elif ratio <= 0.85:
-        skew = "ST vol < MT (cooling)"
-    else:
-        skew = "ST≈MT (balanced)"
+    guide = _universe_guide(avg20, avg60, breadth, ups, downs, mom_breadth)
 
     return {
         "n": len(rows),
-        "avg20": avg20, "avg60": avg60,
+        "avg20": avg20, "avg60": avg60, "med20": med20, "med60": med60,
         "ups": ups, "downs": downs, "sides": sides,
         "breadth": breadth,
-        "skew": skew
+        "mom_breadth": mom_breadth,
+        "adx_avg": adx_avg, "rsi_avg": rsi_avg,
+        "guide": guide
     }
 
 snap = universe_snapshot(SYMBOLS, max_symbols=topn, _seed=(refresh_seed if auto_refresh else None))
 
-with right_side:
+with col_right:
     if snap:
         st.markdown(
             f"""
@@ -462,10 +490,15 @@ with right_side:
   <div style="margin-top:6px;display:grid;grid-template-columns:1fr 1fr;gap:8px;">
     <div><span style="color:#6b7280;">Avg RV20:</span> <b>{snap['avg20']:.1f}%</b></div>
     <div><span style="color:#6b7280;">Avg RV60:</span> <b>{snap['avg60']:.1f}%</b></div>
+    <div><span style="color:#6b7280;">Median RV20:</span> <b>{snap['med20']:.1f}%</b></div>
+    <div><span style="color:#6b7280;">Median RV60:</span> <b>{snap['med60']:.1f}%</b></div>
     <div><span style="color:#6b7280;">Breadth (above 1h EMA200):</span> <b>{snap['breadth']:.0f}%</b></div>
+    <div><span style="color:#6b7280;">Momentum breadth (MACD>signal):</span> <b>{snap['mom_breadth']:.0f}%</b></div>
     <div><span style="color:#6b7280;">Regime votes:</span> <b>↑ {snap['ups']}</b> / <b>↓ {snap['downs']}</b> / <b>↔ {snap['sides']}</b></div>
+    <div><span style="color:#6b7280;">Avg ADX14 (trend strength):</span> <b>{snap['adx_avg']:.1f}</b></div>
+    <div><span style="color:#6b7280;">Avg RSI14:</span> <b>{snap['rsi_avg']:.1f}</b></div>
   </div>
-  <div style="margin-top:6px;color:#374151;">Skew: <b>{snap['skew']}</b></div>
+  <div style="margin-top:8px;color:#374151;">{snap['guide']}</div>
 </div>
 """,
             unsafe_allow_html=True
