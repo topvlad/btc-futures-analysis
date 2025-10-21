@@ -732,14 +732,18 @@ favor_long = _plan_bias_1h(signals, df_1h)
 plan = plan_levels(df_1h.copy(), favor_long)
 
 st.markdown(
-    f"**{plan['note']}**  \n"
-    f"*Alternative:* {plan['alt']}  \n"
-    f"<span style='color:#6b7280'>Plan bias source: 1h ({'above' if signals['1h']['price_vs_ema200']=='above' else 'below'} EMA200; "
-    f"{'EMA20>EMA50' if signals['1h']['ema20_cross_50']=='bull' else 'EMA20<EMA50'}; "
-    f\"{'MACD>signal' if signals['1h']['macd_cross']=='bull' else 'MACD<signal'}). "
-    f"4h veto applies only if strong downtrend (below EMA200 & MACD bear & ADX≥28).</span>",
+    (
+        f"**{plan['note']}**  \n"
+        f"*Alternative:* {plan['alt']}  \n"
+        f"<span style='color:#6b7280'>Plan bias source: 1h ("
+        f"{'above' if signals['1h']['price_vs_ema200']=='above' else 'below'} EMA200; "
+        f"{'EMA20>EMA50' if signals['1h']['ema20_cross_50']=='bull' else 'EMA20<EMA50'}; "
+        f"{'MACD>signal' if signals['1h']['macd_cross']=='bull' else 'MACD<signal'}). "
+        "4h veto applies only if strong downtrend (below EMA200 & MACD bear & ADX≥28).</span>"
+    ),
     unsafe_allow_html=True
 )
+
 
 # ========= MATRIX =========
 def tf_row(tframe):
