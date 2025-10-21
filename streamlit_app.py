@@ -637,37 +637,109 @@ with right:
     else:
         st.info("Top-N snapshot not available (providers busy).")
 
+def _atr_like(df, n=14):
+    h, l, c = df["high"], df["low"], df["close"]
+    tr = pd.concat([
+        (h - l),
+        (h - c.shift()).abs(),
+        (l - c.shift()).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(n).mean()
+
+def _plan_bias_1h(signals: dict, df_1h: pd.DataFrame) -> bool:
+    """
+    Return True if we should favor LONGs based on 1h; False if SHORTs.
+    1h rules:
+      - must be above EMA200 AND (EMA20>EMA50 OR MACD>signal)
+    4h strong-down veto:
+      - if 4h is below EMA200 AND MACD bear AND ADX>=28, flip to SHORT bias
+    """
+    s1 = signals["1h"]; s4 = signals["4h"]
+
+    one_hour_up = (s1["price_vs_ema200"] == "above") and (
+        (s1["ema20_cross_50"] == "bull") or (s1["macd_cross"] == "bull")
+    )
+
+    # strong 4h downtrend can veto
+    strong_4h_down = (
+        (s4["price_vs_ema200"] == "below") and
+        (s4["macd_cross"] == "bear") and
+        (s4.get("adx14", 0) >= 28)
+    )
+
+    if one_hour_up and not strong_4h_down:
+        return True
+
+    if not one_hour_up:
+        return False
+
+    # If both say opposite but 4h isn’t strong, keep 1h bias.
+    return True
+
+
 # ========= PLAN A/B (kept below mid-section) =========
 def swing_levels(df, lookback=30):
     highs = df["high"].tail(lookback); lows = df["low"].tail(lookback)
     return float(highs.max()), float(lows.min())
 
-def plan_levels(df_1h, regime_up: bool):
+def plan_levels(df_1h: pd.DataFrame, favor_long: bool):
+    """
+    Derives entry/stop/targets from 1h using EMAs + swing levels + ATR-like buffer.
+    - LONG: buy pullback toward EMA20/EMA50; stop under recent swing-low minus buffer
+    - SHORT: sell bounce into EMA20/EMA50; stop above recent swing-high plus buffer
+    """
     s = df_1h["close"]
-    ema20v, ema50v = float(ema(s,20).iloc[-1]), float(ema(s,50).iloc[-1])
-    swing_hi, swing_lo = swing_levels(df_1h, 30)
-    if regime_up:
-        entry = (ema20v + ema50v)/2.0
-        stop  = min(swing_lo, entry * 0.993)
-        risk  = entry - stop
-        t1    = entry + risk
-        t2    = max(entry + 2*risk, swing_hi)
-        note  = "Plan A (long): buy dip into EMA20/EMA50 after 1h closes back above; stop below last higher-low; T1=1R, T2=2R/prev high."
-        alt   = "Plan B (flip): if 1h closes below EMA200 and fails to reclaim, look for short on a weak bounce."
+    ema20v, ema50v, ema200v = float(ema(s,20).iloc[-1]), float(ema(s,50).iloc[-1]), float(ema(s,200).iloc[-1])
+    swing_hi = float(df_1h["high"].tail(40).max())
+    swing_lo = float(df_1h["low"].tail(40).min())
+    atr = float(_atr_like(df_1h, 14).iloc[-1] or 0)
+
+    # mid-entry at EMA20/EMA50 mid
+    entry = (ema20v + ema50v) / 2.0
+
+    # dynamic buffer: ~0.35 ATR (tight) but not less than 0.15% of price
+    buf = max(0.0015 * entry, 0.35 * atr)
+
+    if favor_long:
+        # keep long only if price is actually above EMA200
+        if s.iloc[-1] < ema200v:
+            favor_long = False  # safety flip
+
+    if favor_long:
+        stop  = min(swing_lo, entry) - buf
+        risk  = max(1e-9, entry - stop)
+        t1    = entry + risk          # 1R
+        t2    = max(entry + 2*risk, swing_hi)  # 2R or recent high
+        note  = ("Plan A (long): buy dip toward EMA20/EMA50; stop below last swing-low "
+                 "with volatility buffer; T1=1R, T2=2R/prev high.")
+        alt   = ("Plan B (flip): if 1h loses EMA200 and fails to reclaim, switch to short "
+                 "on a weak bounce into EMAs.")
     else:
-        entry = (ema20v + ema50v)/2.0
-        stop  = max(swing_hi, entry * 1.007)
-        risk  = stop - entry
+        stop  = max(swing_hi, entry) + buf
+        risk  = max(1e-9, stop - entry)
         t1    = entry - risk
         t2    = min(entry - 2*risk, swing_lo)
-        note  = "Plan A (short): sell bounce into EMA20/EMA50 after rejection; stop above last lower-high; T1=1R, T2=2R/prev low."
-        alt   = "Plan B (flip): if 1h reclaims EMA200 and holds, prefer longs on pullbacks."
-    return {"entry":entry,"stop":stop,"t1":t1,"t2":t2,"note":note,"alt":alt}
+        note  = ("Plan A (short): sell bounce into EMA20/EMA50; stop above last swing-high "
+                 "with volatility buffer; T1=1R, T2=2R/prev low.")
+        alt   = ("Plan B (flip): if 1h reclaims EMA200 and holds, prefer longs on pullbacks.")
 
-regime_is_up = (agg["label"] == "Trend ↑")
-plan = plan_levels(df_1h.copy(), regime_is_up)
+    return {"entry":entry, "stop":stop, "t1":t1, "t2":t2,
+            "note":note, "alt":alt,
+            "ema200": ema200v, "atr": atr}
 
-st.markdown(f"**{plan['note']}**  \n*Alternative:* {plan['alt']}")
+
+favor_long = _plan_bias_1h(signals, df_1h)
+plan = plan_levels(df_1h.copy(), favor_long)
+
+st.markdown(
+    f"**{plan['note']}**  \n"
+    f"*Alternative:* {plan['alt']}  \n"
+    f"<span style='color:#6b7280'>Plan bias source: 1h ({'above' if signals['1h']['price_vs_ema200']=='above' else 'below'} EMA200; "
+    f"{'EMA20>EMA50' if signals['1h']['ema20_cross_50']=='bull' else 'EMA20<EMA50'}; "
+    f\"{'MACD>signal' if signals['1h']['macd_cross']=='bull' else 'MACD<signal'}). "
+    f"4h veto applies only if strong downtrend (below EMA200 & MACD bear & ADX≥28).</span>",
+    unsafe_allow_html=True
+)
 
 # ========= MATRIX =========
 def tf_row(tframe):
