@@ -1,5 +1,6 @@
-# streamlit_app.py — v1.11.0
-# Clean mid-layout (Narrative left, Top-N table right), notes for each metric, closed-bar & vol line under Prices.
+# streamlit_app.py — v1.12.0
+# New: Universe Index (Top-N composite) + added 1w timeframe
+# Clean mid-layout (Narrative left, Matrix right), notes for each metric, closed-bar & vol line under Prices.
 
 import os, json, math, time, re, requests, pandas as pd, numpy as np
 import streamlit as st
@@ -15,8 +16,10 @@ except Exception:
 
 # ========= CONFIG =========
 REPORT_URL_DEFAULT = "https://topvlad.github.io/btc-futures-analysis/report.json"
-TFS = ["15m", "1h", "4h", "1d"]
-TF_SECONDS = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
+
+# Added weekly timeframe
+TFS = ["15m", "1h", "4h", "1d", "1w"]
+TF_SECONDS = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800}
 
 SPOT_BASES = ["https://api.binance.com","https://api1.binance.com","https://api2.binance.com","https://api3.binance.com","https://api4.binance.com","https://api5.binance.com"]
 FAPI_BASES = ["https://fapi.binance.com","https://fapi1.binance.com","https://fapi2.binance.com","https://fapi3.binance.com","https://fapi4.binance.com","https://fapi5.binance.com"]
@@ -63,7 +66,7 @@ def http_json(url: str, params=None, timeout=8, allow_worker=False):
     for label, full, p in attempts:
         try:
             r = requests.get(full, params=None if label=="WORKER" else p, timeout=timeout,
-                             headers={"Accept":"application/json","User-Agent":"binfapp/1.11.0"})
+                             headers={"Accept":"application/json","User-Agent":"binfapp/1.12.0"})
             if r.status_code != 200: last_e = f"status {r.status_code}"; continue
             ct = (r.headers.get("content-type") or "").lower()
             if "application/json" not in ct and not ("/klines" in full or "/candles" in full):
@@ -74,38 +77,49 @@ def http_json(url: str, params=None, timeout=8, allow_worker=False):
     raise RuntimeError(f"http_json failed: {last_e}")
 
 def http_text(url: str, timeout=8):
-    r = requests.get(url, timeout=timeout, headers={"User-Agent":"binfapp/1.11.0"}); r.raise_for_status()
+    r = requests.get(url, timeout=timeout, headers={"User-Agent":"binfapp/1.12.0"}); r.raise_for_status()
     return r.text
 
 # ========= DYNAMIC UNIVERSE =========
 TOPN_DEFAULT = 10
 
+# New: pull CoinGecko Top-N with caps/vols (for weighting)
 @st.cache_data(ttl=3600, show_spinner=False)
-def _discover_top_coins(top_n: int = TOPN_DEFAULT, _seed=None):
+def _coingecko_topn_with_caps(per_page=100, page=1):
+    """
+    Returns list of dicts: {base, symbol, market_cap, total_volume}
+    """
     try:
         j = requests.get(
             "https://api.coingecko.com/api/v3/coins/markets",
-            params={"vs_currency": "usd", "order": "market_cap_desc", "per_page": 60, "page": 1},
-            timeout=8, headers={"Accept":"application/json","User-Agent":"binfapp/1.11.0"}
+            params={"vs_currency":"usd","order":"market_cap_desc","per_page":per_page,"page":page},
+            timeout=8, headers={"Accept":"application/json","User-Agent":"binfapp/1.12.0"}
         ).json()
-        bases = []
+        out = []
         for it in j:
             sym = (it.get("symbol") or "").upper().strip()
             if sym in ("USDT","USDC","FDUSD","TUSD","DAI","USDD","USDE","PYUSD"):
                 continue
             sym = {"XBT":"BTC","WETH":"ETH"}.get(sym, sym)
-            bases.append(sym)
-        seen, uniq = set(), []
-        for b in bases:
-            if b not in seen:
-                seen.add(b); uniq.append(b)
-            if len(uniq) >= max(1, top_n): break
-        return uniq
+            out.append({
+                "base": sym,
+                "symbol": sym,
+                "market_cap": float(it.get("market_cap") or 0.0),
+                "total_volume": float(it.get("total_volume") or 0.0)
+            })
+        # De-duplicate by base, preserve order
+        seen, dedup = set(), []
+        for it in out:
+            if it["base"] in seen: continue
+            seen.add(it["base"]); dedup.append(it)
+        return dedup
     except Exception:
-        return ["BTC","ETH","BNB","SOL","XRP","ADA","DOGE","TON","TRX","LINK"]
+        # safe baseline
+        bases = ["BTC","ETH","BNB","SOL","XRP","ADA","DOGE","TON","TRX","LINK"]
+        return [{"base":b,"symbol":b,"market_cap":1.0,"total_volume":1.0} for b in bases]
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _binance_futures_universe(candidates: list[str], _seed=None):
+def _binance_futures_universe_from_bases(candidates: list[str], _seed=None):
     try:
         ex = http_json(f"{FAPI_BASES[0]}/fapi/v1/exchangeInfo", timeout=10, allow_worker=bool(CF_WORKER_DEFAULT))
         syms = ex.get("symbols", []) if isinstance(ex, dict) else []
@@ -137,8 +151,19 @@ if "universe_seed" not in st.session_state:
 if st.sidebar.button("↻ Refresh universe now", help="Force refresh of the Top-N list (bypass 1h cache)."):
     st.session_state.universe_seed = int(time.time())
 
-bases = _discover_top_coins(topn, _seed=st.session_state.universe_seed)
-SYMBOLS = _binance_futures_universe(bases, _seed=st.session_state.universe_seed)
+# Weighting scheme for Universe Index
+weighting_scheme = st.sidebar.selectbox(
+    "Universe Index weighting",
+    options=["Market cap (default)","Liquidity (24h volume)","Equal weight"],
+    index=0,
+    help="Applies to the composite in the Universe Index tab."
+)
+
+# Universe discovery with caps/vols
+cg = _coingecko_topn_with_caps()
+bases_ranked = [it["base"] for it in cg]
+bases_trimmed = bases_ranked[:int(topn)]
+SYMBOLS = _binance_futures_universe_from_bases(bases_trimmed, _seed=st.session_state.universe_seed)
 if not SYMBOLS:
     SYMBOLS = ["BTCUSDT","ETHUSDT"]
 if "BTCUSDT" in SYMBOLS:
@@ -190,7 +215,8 @@ def _binance_spot_klines(symbol: str, interval: str, limit: int, worker_url: str
 def _okx_klines(symbol: str, interval: str, limit: int):
     base = _base_from_symbol(symbol)
     inst = f"{base}-USDT"
-    bar_map = {"15m":"15m","1h":"1H","4h":"4H","1d":"1D"}
+    # Added 1w mapping
+    bar_map = {"15m":"15m","1h":"1H","4h":"4H","1d":"1D","1w":"1W"}
     bar = bar_map.get(interval, "1H")
     j = http_json("https://www.okx.com/api/v5/market/candles",
                   params={"instId": inst, "bar": bar, "limit": min(500,limit)}, timeout=8)
@@ -202,7 +228,9 @@ def _coinbase_klines(symbol: str, interval: str, limit: int):
     base = _base_from_symbol(symbol)
     product_map = {"BTC":"BTC-USD","ETH":"ETH-USD"}
     product = product_map.get(base, "BTC-USD")
-    gran = {"15m":900,"1h":3600,"4h":14400,"1d":86400}.get(interval, 3600)
+    # Coinbase has fixed granularities; no native 1w → fall back to 1d for weekly requests
+    gran_map = {"15m":900,"1h":3600,"4h":14400,"1d":86400,"1w":86400}
+    gran = gran_map.get(interval, 3600)
     data = http_json(f"https://api.exchange.coinbase.com/products/{product}/candles", params={"granularity": gran, "limit": min(300,limit)}, timeout=8)
     if not isinstance(data, list) or not data: raise RuntimeError("Coinbase empty")
     return _to_df_coinbase(data), "coinbase"
@@ -320,7 +348,7 @@ def rv_one_liner(rv20: float, rv60: float) -> str:
     else:           level = "calm"
     return f"Volatility is {level}; {skew}"
 
-# ========= CORE LOAD =========
+# ========= CORE LOAD (multi-TF for selected symbol) =========
 @st.cache_data(ttl=60, show_spinner=False)
 def get_all_tf_data(symbol: str, tfs: list[str], limit_each: int = 2000, _seed=None):
     out = {}
@@ -335,23 +363,20 @@ try:
 except Exception as e:
     st.error(f"Klines failed: {e}"); st.stop()
 
-# Use 1h for chart & plan
+# Use 1h for token chart & plan
 df_1h, src_chart = tf_data["1h"]
 last_closed_bar_time = df_1h["ts"].iloc[-1]
 last_close = float(df_1h["close"].iloc[-1])
 
-# === Header captions ===
+# Header captions
 st.caption(f"Prices: **{src_chart}** · Worker: {'ON' if cf_worker else 'OFF'}")
 s_1h = df_1h.set_index("ts")["close"]
 rv20_1h = realized_vol_series(s_1h, 20).iloc[-1] * 100
 rv60_1h = realized_vol_series(s_1h, 60).iloc[-1] * 100
-# << moved up
 st.caption("Using last CLOSED 1h bar (no repaint). Current 1h bar is excluded until it closes.")
 st.caption(rv_one_liner(rv20_1h, rv60_1h))
 
-# === Hero metrics ===
-cA, cB, cC, cD = st.columns([1.2,1.2,1.2,1.2])
-# aggregate regime from TFs
+# Aggregate regime from TFs
 signals = {tf: trend_flags(tf_data[tf][0]) for tf in TFS}
 def aggregate_regime(signals: dict):
     ups = downs = sides = 0; strong = 0
@@ -366,12 +391,7 @@ def aggregate_regime(signals: dict):
     return {"label": label, "conf": conf, "ups": ups, "downs": downs, "sides": sides}
 agg = aggregate_regime(signals)
 
-cA.metric("Regime (aggregate)", f"{agg['label']}", f"conf: {agg['conf']}")
-cB.metric("Last Close (1h)", kpretty(last_close), last_closed_bar_time.strftime("%Y-%m-%d %H:%M UTC"))
-cC.metric("RV20% (1h, annualized)", f"{rv20_1h:0.1f}%")
-cD.metric("RV60% (1h, annualized)", f"{rv60_1h:0.1f}%")
-
-# ========= TOP-N SNAPSHOT (table) =========
+# ========= Universe snapshot (for Universe tab) =========
 @st.cache_data(ttl=180, show_spinner=False)
 def _symbol_vitals(symbol: str):
     try:
@@ -464,10 +484,7 @@ def universe_snapshot(symbols: list[str], max_symbols: int = 12, _seed=None):
 
 snap = universe_snapshot(SYMBOLS, max_symbols=topn, _seed=(refresh_seed if auto_refresh else None))
 
-# ========= MID SECTION: 2-cell layout =========
-left, spacer, right = st.columns([1.0, 0.01, 1.9])
-
-# ---- LEFT: Narrative & Decision ----
+# ========= Funding, OI & News helpers =========
 def narrative_story(agg, signals, funding_level, funding_side, fund_mean_24h, news_risk):
     s1h, s4h, sd = signals["1h"], signals["4h"], signals["1d"]
     lines = []
@@ -488,7 +505,6 @@ def narrative_story(agg, signals, funding_level, funding_side, fund_mean_24h, ne
         lines.append("Headline risk up — keep size smaller or wait 30–60m after news.")
     return lines
 
-# funding & news (needed for narrative)
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_funding(symbol: str, limit: int = 48, _seed=None):
     try:
@@ -537,11 +553,6 @@ def fetch_open_interest(symbol: str, _seed=None):
     except Exception:
         return None, "none"
 
-fdf, fsrc = fetch_funding(symbol, limit=48, _seed=(refresh_seed if auto_refresh else None))
-last_funding = float(fdf["fundingRate"].iloc[-1]) if isinstance(fdf, pd.DataFrame) and not fdf.empty else None
-funding_str, funding_level, funding_side = (funding_tilt(last_funding) if last_funding is not None else ("n/a","neutral","Flat"))
-fund_mean_24h = float(fdf["fundingRate"].tail(3).mean()) if isinstance(fdf, pd.DataFrame) and len(fdf) >= 3 else None
-
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_news(feeds: list[str], lookback_hours: int = 24, max_items: int = 8, term: str = "Bitcoin", _seed=None):
     out = []; cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
@@ -573,70 +584,16 @@ def fetch_news(feeds: list[str], lookback_hours: int = 24, max_items: int = 8, t
         seen.add(it["link"]); dedup.append(it)
     return dedup[:max_items]
 
+fdf, fsrc = fetch_funding(symbol, limit=48, _seed=(refresh_seed if auto_refresh else None))
+last_funding = float(fdf["fundingRate"].iloc[-1]) if isinstance(fdf, pd.DataFrame) and not fdf.empty else None
+funding_str, funding_level, funding_side = (funding_tilt(last_funding) if last_funding is not None else ("n/a","neutral","Flat"))
+fund_mean_24h = float(fdf["fundingRate"].tail(3).mean()) if isinstance(fdf, pd.DataFrame) and len(fdf) >= 3 else None
+
 news_items = fetch_news(NEWS_FEEDS, NEWS_LOOKBACK_HOURS, 8, term=_news_term(symbol),
                         _seed=(refresh_seed if auto_refresh else None))
 news_risk = "elevated" if news_items and any(re.search(r"(hack|exploit|liquidat|halt|delay|lawsuit|ban|shutdown|outage|security|CPI|rate)", n["title"], flags=re.I) for n in news_items[:5]) else "normal"
 
-with left:
-    st.subheader("Token Vitals (multi-TF)")
-    st.markdown(
-        f"Aggregate Regime: **{agg['label']}** (confidence: *{agg['conf']}*)<br>"
-        f"<span style='color:#6b7280'>TF votes — ↑:{agg['ups']} / ↓:{agg['downs']} / ↔:{agg['sides']}</span>",
-        unsafe_allow_html=True,
-    )
-
-    tale_lines = narrative_story(agg, signals, funding_level, funding_side, fund_mean_24h, news_risk)
-    st.markdown("\n".join([f"- {ln}" for ln in tale_lines]))
-
-# ---- RIGHT: Top-N table with notes ----
-with right:
-    if snap:
-        now_utc = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
-        # build rows: (param, value, note)
-        rows = [
-            ("Avg RV20", f"{snap['avg20']:.1f}%", _level_note_rv(snap['avg20'])),
-            ("Avg RV60", f"{snap['avg60']:.1f}%", _level_note_rv(snap['avg60'])),
-            ("Median RV20", f"{snap['med20']:.1f}%", ""),
-            ("Median RV60", f"{snap['med60']:.1f}%", ""),
-            ("Breadth (above 1h EMA200)", f"{snap['breadth']:.0f}%", "higher = broader uptrend"),
-            ("Momentum breadth (MACD>signal)", f"{snap['mom_breadth']:.0f}%", "higher = more coins with bullish momentum"),
-            ("Regime votes", f"↑ {snap['ups']} / ↓ {snap['downs']} / ↔ {snap['sides']}", "bias from up vs down counts"),
-            ("Avg ADX14 (trend strength)", f"{snap['adx_avg']:.1f}", _note_adx(snap['adx_avg'])),
-            ("Avg RSI14", f"{snap['rsi_avg']:.1f}", _note_rsi(snap['rsi_avg'])),
-            ("Universe guide", "", snap['guide'])
-        ]
-        # HTML table
-        table_html = [
-            f"""
-<div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;padding:12px;">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
-    <div style="font-weight:600;">Top-N snapshot (N={snap['n']})</div>
-    <div style="font-size:12px;color:#6b7280;">{now_utc}</div>
-  </div>
-  <table style="width:100%;border-collapse:collapse;">
-    <thead>
-      <tr>
-        <th style="text-align:left;border-bottom:1px solid #e5e7eb;padding:6px 4px;color:#6b7280;width:36%;">Parameter</th>
-        <th style="text-align:left;border-bottom:1px solid #e5e7eb;padding:6px 4px;color:#6b7280;width:20%;">Value</th>
-        <th style="text-align:left;border-bottom:1px solid #e5e7eb;padding:6px 4px;color:#6b7280;width:44%;">Note / dynamics</th>
-      </tr>
-    </thead>
-    <tbody>
-"""
-        ]
-        for p, v, n in rows:
-            table_html.append(
-                f"""<tr>
-<td style="padding:6px 4px;border-bottom:1px solid #f1f5f9;">{p}</td>
-<td style="padding:6px 4px;border-bottom:1px solid #f1f5f9;">{v}</td>
-<td style="padding:6px 4px;border-bottom:1px solid #f1f5f9;color:#374151;">{n}</td>
-</tr>"""
-            )
-        table_html.append("</tbody></table></div>")
-        st.markdown("\n".join(table_html), unsafe_allow_html=True)
-    else:
-        st.info("Top-N snapshot not available (providers busy).")
-
+# ========= PLAN A/B =========
 def _atr_like(df, n=14):
     h, l, c = df["high"], df["low"], df["close"]
     tr = pd.concat([
@@ -660,7 +617,6 @@ def _plan_bias_1h(signals: dict, df_1h: pd.DataFrame) -> bool:
         (s1["ema20_cross_50"] == "bull") or (s1["macd_cross"] == "bull")
     )
 
-    # strong 4h downtrend can veto
     strong_4h_down = (
         (s4["price_vs_ema200"] == "below") and
         (s4["macd_cross"] == "bear") and
@@ -673,43 +629,30 @@ def _plan_bias_1h(signals: dict, df_1h: pd.DataFrame) -> bool:
     if not one_hour_up:
         return False
 
-    # If both say opposite but 4h isn’t strong, keep 1h bias.
     return True
 
-
-# ========= PLAN A/B (kept below mid-section) =========
 def swing_levels(df, lookback=30):
     highs = df["high"].tail(lookback); lows = df["low"].tail(lookback)
     return float(highs.max()), float(lows.min())
 
 def plan_levels(df_1h: pd.DataFrame, favor_long: bool):
-    """
-    Derives entry/stop/targets from 1h using EMAs + swing levels + ATR-like buffer.
-    - LONG: buy pullback toward EMA20/EMA50; stop under recent swing-low minus buffer
-    - SHORT: sell bounce into EMA20/EMA50; stop above recent swing-high plus buffer
-    """
     s = df_1h["close"]
     ema20v, ema50v, ema200v = float(ema(s,20).iloc[-1]), float(ema(s,50).iloc[-1]), float(ema(s,200).iloc[-1])
     swing_hi = float(df_1h["high"].tail(40).max())
     swing_lo = float(df_1h["low"].tail(40).min())
     atr = float(_atr_like(df_1h, 14).iloc[-1] or 0)
 
-    # mid-entry at EMA20/EMA50 mid
     entry = (ema20v + ema50v) / 2.0
-
-    # dynamic buffer: ~0.35 ATR (tight) but not less than 0.15% of price
     buf = max(0.0015 * entry, 0.35 * atr)
 
-    if favor_long:
-        # keep long only if price is actually above EMA200
-        if s.iloc[-1] < ema200v:
-            favor_long = False  # safety flip
+    if favor_long and s.iloc[-1] < ema200v:
+        favor_long = False  # safety flip
 
     if favor_long:
         stop  = min(swing_lo, entry) - buf
         risk  = max(1e-9, entry - stop)
-        t1    = entry + risk          # 1R
-        t2    = max(entry + 2*risk, swing_hi)  # 2R or recent high
+        t1    = entry + risk
+        t2    = max(entry + 2*risk, swing_hi)
         note  = ("Plan A (long): buy dip toward EMA20/EMA50; stop below last swing-low "
                  "with volatility buffer; T1=1R, T2=2R/prev high.")
         alt   = ("Plan B (flip): if 1h loses EMA200 and fails to reclaim, switch to short "
@@ -727,25 +670,10 @@ def plan_levels(df_1h: pd.DataFrame, favor_long: bool):
             "note":note, "alt":alt,
             "ema200": ema200v, "atr": atr}
 
-
 favor_long = _plan_bias_1h(signals, df_1h)
 plan = plan_levels(df_1h.copy(), favor_long)
 
-st.markdown(
-    (
-        f"**{plan['note']}**  \n"
-        f"*Alternative:* {plan['alt']}  \n"
-        f"<span style='color:#6b7280'>Plan bias source: 1h ("
-        f"{'above' if signals['1h']['price_vs_ema200']=='above' else 'below'} EMA200; "
-        f"{'EMA20>EMA50' if signals['1h']['ema20_cross_50']=='bull' else 'EMA20<EMA50'}; "
-        f"{'MACD>signal' if signals['1h']['macd_cross']=='bull' else 'MACD<signal'}). "
-        "4h veto applies only if strong downtrend (below EMA200 & MACD bear & ADX≥28).</span>"
-    ),
-    unsafe_allow_html=True
-)
-
-
-# ========= MATRIX =========
+# ========= MATRIX (multi-TF) =========
 def tf_row(tframe):
     df2, _ = tf_data[tframe]
     s2 = signals[tframe]
@@ -790,70 +718,275 @@ def color_rec(val):
     if val=="Sell rips": return "background-color:#ffd1d1"
     return "background-color:#fff2cc"
 
-st.subheader("Signal matrix (multi-TF)")
-styled = (
-    mat.style
-      .applymap(color_updown, subset=["ema200_dir"])
-      .applymap(color_yesno, subset=["ema20>50","macd","rsi>ma5"])
-      .applymap(color_rsi, subset=["rsi","rsi_ma5"])
-      .applymap(color_adx, subset=["adx"])
-      .applymap(color_rec, subset=["recommend"])
-      .format({"close":"{:.2f}","rsi":"{:.1f}","rsi_ma5":"{:.1f}","adx":"{:.1f}","rv20%":"{:.1f}%"})
-)
-st.dataframe(styled, use_container_width=True)
-
-# ========= CHART =========
-with st.expander("Chart (1h)", expanded=True):
-    df = df_1h.copy()
-    x_ts = df["ts"]; close_s = df["close"]
-    ema20s, ema50s, ema200s = ema(close_s,20), ema(close_s,50), ema(close_s,200)
-    if not PLOTLY:
-        st.line_chart(close_s.set_axis(x_ts), use_container_width=True)
+# ========= UNIVERSE INDEX (MVP) =========
+# Build weights once per day (UTC): reconstitute Top-N & weights
+def _weights_from_cg(bases: list[str], scheme: str):
+    # lookup cg row by base
+    by_base = {it["base"]: it for it in cg}
+    rows = [by_base.get(b, {"market_cap":1.0,"total_volume":1.0}) for b in bases]
+    if scheme.startswith("Market cap"):
+        raw = np.array([r["market_cap"] or 0.0 for r in rows], dtype=float)
+    elif scheme.startswith("Liquidity"):
+        raw = np.array([r["total_volume"] or 0.0 for r in rows], dtype=float)
     else:
-        fig = go.Figure()
-        fig.add_trace(go.Candlestick(
-            x=x_ts, open=df["open"], high=df["high"], low=df["low"], close=df["close"],
-            name="OHLC", opacity=0.85
-        ))
-        fig.add_trace(go.Scatter(x=x_ts, y=ema20s,  name="EMA20",  line=dict(width=1.5)))
-        fig.add_trace(go.Scatter(x=x_ts, y=ema50s,  name="EMA50",  line=dict(width=1.5)))
-        fig.add_trace(go.Scatter(x=x_ts, y=ema200s, name="EMA200", line=dict(width=1.5)))
-        for n in sorted(set(int(x) for x in extra_emas if isinstance(x,(int,float)))):
-            try:
-                fig.add_trace(go.Scatter(x=x_ts, y=ema(close_s, n), name=f"EMA{n}", line=dict(width=1)))
-            except Exception:
-                pass
-        if overlay_plan:
-            for y, name, dash in [
-                (plan["entry"],"Entry","dot"),
-                (plan["stop"],"Stop","dash"),
-                (plan["t1"],"T1","dash"),
-                (plan["t2"],"T2","dash")
-            ]:
-                fig.add_hline(y=y, line_dash=dash, annotation_text=f"{name}: {y:,.2f}", annotation_position="right")
-        fig.update_layout(height=520, margin=dict(l=10,r=10,t=30,b=10), xaxis_rangeslider_visible=False)
-        st.plotly_chart(fig, use_container_width=True)
+        raw = np.ones(len(rows), dtype=float)
+    raw = np.where(np.isfinite(raw) & (raw>0), raw, 0.0)
+    if raw.sum() <= 0:
+        w = np.ones_like(raw) / max(1,len(raw))
+    else:
+        w = raw / raw.sum()
+    return w
 
-# ========= Funding, OI & News =========
-with st.expander("Funding & Open Interest (Futures context)"):
-    try:
-        if isinstance(fdf, pd.DataFrame) and not fdf.empty:
-            st.metric(f"Last funding ({fsrc})", f"{fdf['fundingRate'].iloc[-1]*100:.4f}% / 8h")
-            if fund_mean_24h is not None:
-                st.caption(f"24h mean: {fund_mean_24h*100:.4f}% / 8h  ·  bias: {'longs pay' if fund_mean_24h>0 else ('shorts pay' if fund_mean_24h<0 else 'flat')}")
-            st.line_chart(fdf.set_index("fundingTime")["fundingRate"]*100, height=160)
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def universe_daily_spec(symbols: list[str], bases_for_symbols: list[str], scheme: str, day_key: str):
+    """
+    Returns dict with 'symbols', 'weights' arrays for the day (freeze basket/weights for 24h).
+    """
+    weights = _weights_from_cg(bases_for_symbols, scheme)
+    return {"symbols": symbols, "bases": bases_for_symbols, "weights": weights.tolist(), "scheme": scheme, "day": day_key}
+
+def _today_key():
+    # UTC date as key
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+def _symbols_and_bases_for_universe(symbols: list[str]):
+    bases = [_base_from_symbol(s) for s in symbols]
+    return symbols, bases
+
+# Composite builder (close-only, normalized weighted sum)
+@st.cache_data(ttl=300, show_spinner=False)
+def composite_series(symbols: list[str], weights: list[float], interval: str, limit_each: int = 1500, method: str = "arith"):
+    """
+    method: 'arith' (normalized weighted sum) or 'geom' (weighted geometric)
+    Returns DataFrame: ts, composite (float)
+    """
+    dfs = []
+    for s in symbols:
+        df, _ = get_klines_df(s, interval, limit=limit_each)
+        df = drop_unclosed(df, interval)
+        dfs.append(df[["ts","close"]].rename(columns={"close":_base_from_symbol(s)}))
+    if not dfs: raise RuntimeError("No data for composite")
+    # inner-join on timestamps to ensure aligned bars
+    merged = dfs[0]
+    for d in dfs[1:]:
+        merged = pd.merge(merged, d, on="ts", how="inner")
+    if merged.empty or merged.shape[1] < 2:
+        raise RuntimeError("Composite merge resulted in empty set")
+    merged = merged.sort_values("ts").reset_index(drop=True)
+    cols = [c for c in merged.columns if c!="ts"]
+    X = merged[cols].astype(float)
+
+    # normalize each asset to 1.0 at start
+    norm = X / X.iloc[0]
+    w = np.array(weights, dtype=float)
+    w = w[:len(cols)]
+    if w.sum() <= 0: w = np.ones(len(cols))/len(cols)
+
+    if method == "geom":
+        # weighted log-sum → exp back
+        lognorm = np.log(norm.replace(0, np.nan)).fillna(method="ffill").fillna(0.0)
+        comp = np.exp(np.matmul(lognorm.values, w.reshape(-1,1)).ravel())
+    else:
+        comp = np.matmul(norm.values, w.reshape(-1,1)).ravel()
+
+    out = pd.DataFrame({"ts": merged["ts"], "composite": comp})
+    return out
+
+# ========= TABS LAYOUT =========
+tab_token, tab_universe = st.tabs(["Token", "Universe Index"])
+
+with tab_token:
+    # ---- LEFT: Narrative & Decision ----
+    left, spacer, right = st.columns([1.0, 0.02, 1.4])
+
+    with left:
+        st.subheader("Token Vitals (multi-TF)")
+        st.markdown(
+            f"Aggregate Regime: **{agg['label']}** (confidence: *{agg['conf']}*)<br>"
+            f"<span style='color:#6b7280'>TF votes — ↑:{agg['ups']} / ↓:{agg['downs']} / ↔:{agg['sides']}</span>",
+            unsafe_allow_html=True,
+        )
+        tale_lines = narrative_story(agg, signals, funding_level, funding_side, fund_mean_24h, news_risk)
+        st.markdown("\n".join([f"- {ln}" for ln in tale_lines]))
+
+        st.markdown(
+            (
+                f"**{plan['note']}**  \n"
+                f"*Alternative:* {plan['alt']}  \n"
+                f"<span style='color:#6b7280'>Plan bias source: 1h ("
+                f"{'above' if signals['1h']['price_vs_ema200']=='above' else 'below'} EMA200; "
+                f"{'EMA20>EMA50' if signals['1h']['ema20_cross_50']=='bull' else 'EMA20<EMA50'}; "
+                f"{'MACD>signal' if signals['1h']['macd_cross']=='bull' else 'MACD<signal'}). "
+                "4h veto applies only if strong downtrend (below EMA200 & MACD bear & ADX≥28).</span>"
+            ),
+            unsafe_allow_html=True
+        )
+
+    with right:
+        st.subheader("Signal matrix (multi-TF)")
+        styled = (
+            mat.style
+              .applymap(color_updown, subset=["ema200_dir"])
+              .applymap(color_yesno, subset=["ema20>50","macd","rsi>ma5"])
+              .applymap(color_rsi, subset=["rsi","rsi_ma5"])
+              .applymap(color_adx, subset=["adx"])
+              .applymap(color_rec, subset=["recommend"])
+              .format({"close":"{:.2f}","rsi":"{:.1f}","rsi_ma5":"{:.1f}","adx":"{:.1f}","rv20%":"{:.1f}%"})
+        )
+        st.dataframe(styled, use_container_width=True)
+
+    # ========= CHART =========
+    with st.expander("Chart (1h)", expanded=True):
+        df = df_1h.copy()
+        x_ts = df["ts"]; close_s = df["close"]
+        ema20s, ema50s, ema200s = ema(close_s,20), ema(close_s,50), ema(close_s,200)
+        if not PLOTLY:
+            st.line_chart(close_s.set_axis(x_ts), use_container_width=True)
         else:
-            st.info("No funding data.")
-    except Exception as e:
-        st.warning(f"Funding error: {e}")
+            fig = go.Figure()
+            fig.add_trace(go.Candlestick(
+                x=x_ts, open=df["open"], high=df["high"], low=df["low"], close=df["close"],
+                name="OHLC", opacity=0.85
+            ))
+            fig.add_trace(go.Scatter(x=x_ts, y=ema20s,  name="EMA20",  line=dict(width=1.5)))
+            fig.add_trace(go.Scatter(x=x_ts, y=ema50s,  name="EMA50",  line=dict(width=1.5)))
+            fig.add_trace(go.Scatter(x=x_ts, y=ema200s, name="EMA200", line=dict(width=1.5)))
+            for n in sorted(set(int(x) for x in extra_emas if isinstance(x,(int,float)))):
+                try:
+                    fig.add_trace(go.Scatter(x=x_ts, y=ema(close_s, n), name=f"EMA{n}", line=dict(width=1)))
+                except Exception:
+                    pass
+            if overlay_plan:
+                for y, name, dash in [
+                    (plan["entry"],"Entry","dot"),
+                    (plan["stop"],"Stop","dash"),
+                    (plan["t1"],"T1","dash"),
+                    (plan["t2"],"T2","dash")
+                ]:
+                    fig.add_hline(y=y, line_dash=dash, annotation_text=f"{name}: {y:,.2f}", annotation_position="right")
+            fig.update_layout(height=520, margin=dict(l=10,r=10,t=30,b=10), xaxis_rangeslider_visible=False)
+            st.plotly_chart(fig, use_container_width=True)
 
-with st.expander("News (last 24h)", expanded=False):
-    if news_items:
-        for n in news_items:
-            ts = n["ts"].strftime("%Y-%m-%d %H:%M UTC")
-            st.markdown(f"- [{n['title']}]({n['link']})  —  *{ts}*")
-    else:
-        st.info(f"No fresh {_news_term(symbol)} headlines found in the last 24h.")
+    # ========= Funding & News =========
+    with st.expander("Funding & Open Interest (Futures context)"):
+        try:
+            if isinstance(fdf, pd.DataFrame) and not fdf.empty:
+                st.metric(f"Last funding ({fsrc})", f"{fdf['fundingRate'].iloc[-1]*100:.4f}% / 8h")
+                if fund_mean_24h is not None:
+                    st.caption(f"24h mean: {fund_mean_24h*100:.4f}% / 8h  ·  bias: {'longs pay' if fund_mean_24h>0 else ('shorts pay' if fund_mean_24h<0 else 'flat')}")
+                st.line_chart(fdf.set_index("fundingTime")["fundingRate"]*100, height=160)
+            else:
+                st.info("No funding data.")
+        except Exception as e:
+            st.warning(f"Funding error: {e}")
+
+    with st.expander("News (last 24h)", expanded=False):
+        if news_items:
+            for n in news_items:
+                ts = n["ts"].strftime("%Y-%m-%d %H:%M UTC")
+                st.markdown(f"- [{n['title']}]({n['link']})  —  *{ts}*")
+        else:
+            st.info(f"No fresh {_news_term(symbol)} headlines found in the last 24h.")
+
+# ========= UNIVERSE TAB =========
+with tab_universe:
+    st.subheader("Universe Index (Top-N Composite)")
+
+    # Daily basket/weights freeze
+    syms_for_universe, bases_for_universe = _symbols_and_bases_for_universe(SYMBOLS[:topn])
+    spec = universe_daily_spec(syms_for_universe, bases_for_universe, weighting_scheme, _today_key())
+
+    # Build composite on selected timeframe (use 1h by default for UI responsiveness; allow change)
+    comp_tf = st.selectbox("Composite timeframe", options=["15m","1h","4h","1d"], index=1,
+                           help="Composite built from close-only series; candles require heavy OHLC sync.")
+    comp_method = st.selectbox("Index combine method", options=["Arithmetic (normalized sum)","Geometric (log-sum)"], index=0)
+    method_key = "geom" if comp_method.startswith("Geometric") else "arith"
+
+    try:
+        comp_df = composite_series(spec["symbols"], spec["weights"], comp_tf, limit_each=1200, method=method_key)
+        comp_df = comp_df.dropna().sort_values("ts")
+        comp_df = comp_df.iloc[-1000:]  # keep it snappy
+        scomp = comp_df.set_index("ts")["composite"]
+        c_ema20, c_ema50, c_ema200 = ema(scomp,20), ema(scomp,50), ema(scomp,200)
+        c_rv20 = float(realized_vol_series(scomp,20).iloc[-1] * 100)
+        c_rv60 = float(realized_vol_series(scomp,60).iloc[-1] * 100)
+        c_macd_line, c_macd_sig, c_macd_hist = macd(scomp)
+
+        # Headline
+        h1, h2, h3, h4 = st.columns([1.2,1.2,1.2,1.2])
+        h1.metric("Composite RV20%", f"{c_rv20:.1f}%")
+        h2.metric("Composite RV60%", f"{c_rv60:.1f}%")
+        if snap:
+            h3.metric("Breadth (above 1h EMA200)", f"{snap['breadth']:.0f}%")
+            h4.metric("Momentum breadth (MACD>signal)", f"{snap['mom_breadth']:.0f}%")
+        st.caption(rv_one_liner(c_rv20, c_rv60))
+
+        # Chart
+        if PLOTLY:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=comp_df["ts"], y=comp_df["composite"], name="Composite", line=dict(width=2)))
+            fig.add_trace(go.Scatter(x=c_ema20.index, y=c_ema20.values, name="EMA20", line=dict(width=1.3)))
+            fig.add_trace(go.Scatter(x=c_ema50.index, y=c_ema50.values, name="EMA50", line=dict(width=1.3)))
+            fig.add_trace(go.Scatter(x=c_ema200.index, y=c_ema200.values, name="EMA200", line=dict(width=1.3)))
+            fig.update_layout(height=460, margin=dict(l=10,r=10,t=30,b=10), xaxis_rangeslider_visible=False)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.line_chart(comp_df.set_index("ts")["composite"], height=300, use_container_width=True)
+
+        # Top-N snapshot table (moved here from Token tab)
+        if snap:
+            now_utc = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+            rows = [
+                ("Avg RV20", f"{snap['avg20']:.1f}%", _level_note_rv(snap['avg20'])),
+                ("Avg RV60", f"{snap['avg60']:.1f}%", _level_note_rv(snap['avg60'])),
+                ("Median RV20", f"{snap['med20']:.1f}%", ""),
+                ("Median RV60", f"{snap['med60']:.1f}%", ""),
+                ("Breadth (above 1h EMA200)", f"{snap['breadth']:.0f}%", "higher = broader uptrend"),
+                ("Momentum breadth (MACD>signal)", f"{snap['mom_breadth']:.0f}%", "higher = more coins with bullish momentum"),
+                ("Regime votes", f"↑ {snap['ups']} / ↓ {snap['downs']} / ↔ {snap['sides']}", "bias from up vs down counts"),
+                ("Avg ADX14 (trend strength)", f"{snap['adx_avg']:.1f}", _note_adx(snap['adx_avg'])),
+                ("Avg RSI14", f"{snap['rsi_avg']:.1f}", _note_rsi(snap['rsi_avg'])),
+                ("Universe guide", "", snap['guide'])
+            ]
+            table_html = [
+                f"""
+<div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;padding:12px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+    <div style="font-weight:600;">Top-N snapshot (N={snap['n']})</div>
+    <div style="font-size:12px;color:#6b7280;">{now_utc}</div>
+  </div>
+  <table style="width:100%;border-collapse:collapse;">
+    <thead>
+      <tr>
+        <th style="text-align:left;border-bottom:1px solid #e5e7eb;padding:6px 4px;color:#6b7280;width:36%;">Parameter</th>
+        <th style="text-align:left;border-bottom:1px solid #e5e7eb;padding:6px 4px;color:#6b7280;width:20%;">Value</th>
+        <th style="text-align:left;border-bottom:1px solid #e5e7eb;padding:6px 4px;color:#6b7280;width:44%;">Note / dynamics</th>
+      </tr>
+    </thead>
+    <tbody>
+"""
+            ]
+            for p, v, n in rows:
+                table_html.append(
+                    f"""<tr>
+<td style="padding:6px 4px;border-bottom:1px solid #f1f5f9;">{p}</td>
+<td style="padding:6px 4px;border-bottom:1px solid #f1f5f9;">{v}</td>
+<td style="padding:6px 4px;border-bottom:1px solid #f1f5f9;color:#374151;">{n}</td>
+</tr>"""
+                )
+            table_html.append("</tbody></table></div>")
+            st.markdown("\n".join(table_html), unsafe_allow_html=True)
+        else:
+            st.info("Top-N snapshot not available (providers busy).")
+
+        # Helper text
+        st.caption(
+            "Notes: Basket & weights reconstituted once per UTC day (frozen for the session). "
+            "Composite built from close-only, normalized per-asset at window start; "
+            "choose Arithmetic or Geometric combine method."
+        )
+    except Exception as e:
+        st.error(f"Composite build failed: {e}")
 
 # ========= report.json (debug) =========
 payload = None
