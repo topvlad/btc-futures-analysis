@@ -618,7 +618,7 @@ def universe_snapshot_tf(symbols: list[str], tf: str, max_symbols: int = 12):
     ups = sum(1 for x in labels if x == "Trend ↑"); downs = sum(1 for x in labels if x == "Trend ↓"); sides = len(labels)-ups-downs
     breadth = 100.0 * above / max(1, len(rows)); mom_breadth = 100.0 * mom_bull / max(1, len(rows))
     adx_avg = float(np.mean(adx_vals)); rsi_avg = float(np.mean(rsi_vals))
-    guide = _universe_guide(avg20, avg60, breadth, ups, downs, mom_breadth)
+    guide = _universe_guide(avg20, avg60, breadth, ups, downs, mom_breadth, adx_avg)
     return {"n": len(rows), "avg20": avg20, "avg60": avg60, "med20": med20, "med60": med60,
             "ups": ups, "downs": downs, "sides": sides, "breadth": breadth, "mom_breadth": mom_breadth,
             "adx_avg": adx_avg, "rsi_avg": rsi_avg, "guide": guide}
@@ -833,8 +833,7 @@ with tab_universe:
         
             cross_text = _cross_effects_text(snap['avg20'], snap['avg60'], snap['breadth'],
                                              snap['mom_breadth'], snap['adx_avg'])
-            guide = _universe_guide(snap['avg20'], snap['avg60'], snap['breadth'],
-                                    snap['ups'], snap['downs'], snap['mom_breadth'], snap['adx_avg'])
+            guide = snap["guide"]
         
             rows = [
                 ("Avg RV20", f"{snap['avg20']:.1f}%", f"{rv20_lab} — {rv20_txt}"),
