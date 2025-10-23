@@ -306,12 +306,14 @@ def regime_score(sig):
     return score, conf, label
 
 def funding_tilt(last_rate: float):
-    if last_rate is None: return "unknown", "n/a", "n/a"
+    if last_rate is None:
+        return "unknown", "n/a", "n/a"
     mag = abs(last_rate)
     level = "neutral" if mag < 0.0001 else ("elevated" if mag < 0.0005 else "extreme")
-    side = "Longs → Shorts" if last_rate > 0 else ("Shorts → Longs" if last_rate < 0) or "Flat"
+    side = "Longs → Shorts" if last_rate > 0 else ("Shorts → Longs" if last_rate < 0 else "Flat")
     bps = last_rate * 10000.0
     return f"{bps:+.2f} bps / 8h", level, side
+
 
 def per_tf_recommendation(sig):
     up = (sig["price_vs_ema200"]=="above"); align = (sig["ema20_cross_50"]=="bull"); mom = (sig["macd_cross"]=="bull"); adx_ok = sig["adx14"] >= 22
