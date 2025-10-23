@@ -468,31 +468,139 @@ def _symbol_vitals_tf(symbol: str, tf: str):
     except Exception:
         return {"ok": False}
 
-def _level_note_rv(x: float) -> str:
-    if x >= 100: return "very high"
-    if x >= 70:  return "high"
-    if x >= 40:  return "moderate"
-    return "calm"
-def _note_adx(x: float) -> str:
-    if x >= 28: return "strong trend"
-    if x >= 22: return "building trend"
-    return "low trend strength"
-def _note_rsi(x: float) -> str:
-    if x >= 70: return "overbought-ish"
-    if x <= 30: return "oversold-ish"
-    return "neutral"
+# ---- 5-level bucketing + standard notes ----
+def _bucket(value: float, edges: list[float], labels: list[str]):
+    """
+    edges: ascending cutoffs for 5 buckets -> [e1, e2, e3, e4]
+    returns (label, idx 0..4)
+    """
+    if value is None or not np.isfinite(value): return "n/a", 2
+    idx = 0
+    for i, e in enumerate(edges):
+        if value < e:
+            idx = i
+            break
+    else:
+        idx = 4
+    return labels[idx], idx
 
-def _universe_guide(avg20, avg60, breadth_pct, ups, downs, mom_breadth):
-    level = _level_note_rv(max(avg20, avg60))
-    bias = "up" if ups > downs else ("down" if downs > ups else "mixed")
+def _note_rv(value: float):
+    # % annualized; tuned for crypto
+    labels = ["low","med-low","average","med-high","high"]
+    # <30, <45, <60, <85, >=85
+    lab, idx = _bucket(value, [30, 45, 60, 85], labels)
+    # standard text
+    text = {
+        0: "very calm; breakouts often fade; tight stops ok",
+        1: "calm; mean-reversion favoured",
+        2: "balanced; no strong vol edge",
+        3: "elevated; momentum entries hold better",
+        4: "high; wide swings; size down / wider stops",
+    }[idx]
+    return f"{lab}", text, idx
+
+def _note_adx(value: float):
+    labels = ["low","med-low","average","med-high","high"]
+    # <17, <22, <28, <38, >=38
+    lab, idx = _bucket(value, [17, 22, 28, 38], labels)
+    text = {
+        0: "very weak trend; ranges dominate",
+        1: "weak trend; breakouts unreliable",
+        2: "trend building; breakouts improving",
+        3: "strong trend; breakouts more likely to hold",
+        4: "very strong trend; pullbacks preferred to chasing",
+    }[idx]
+    return f"{lab}", text, idx
+
+def _note_rsi(value: float):
+    labels = ["low","med-low","average","med-high","high"]
+    # <=25, <=40, <=60, <=75, >75
+    lab, idx = _bucket(value, [25.01, 40.01, 60.01, 75.01], labels)
+    text = {
+        0: "oversold zone",
+        1: "tilt to oversold",
+        2: "neutral",
+        3: "tilt to overbought",
+        4: "overbought zone",
+    }[idx]
+    return f"{lab}", text, idx
+
+def _note_pct(value: float, kind: str):
+    """
+    Generic 5-bucket note for percentages (breadth, momentum breadth).
+    """
+    labels = ["low","med-low","average","med-high","high"]
+    # <30, <45, <55, <70, >=70
+    lab, idx = _bucket(value, [30, 45, 55, 70], labels)
+    if kind == "breadth":
+        extra = {
+            0: "narrow advance; leadership thin",
+            1: "modestly narrow participation",
+            2: "balanced participation",
+            3: "broadening participation",
+            4: "very broad uptrend participation",
+        }[idx]
+    else:  # momentum breadth
+        extra = {
+            0: "few coins with bullish momentum",
+            1: "limited momentum leadership",
+            2: "mixed momentum",
+            3: "solid momentum participation",
+            4: "widespread momentum",
+        }[idx]
+    return f"{lab}", extra, idx
+
+def _cross_effects_text(avg20, avg60, breadth, mom_breadth, adx_avg):
+    # RV skew
     skew_ratio = avg20 / max(avg60, 1e-9)
-    if skew_ratio >= 1.15: skew = "vol expanding short-term → momentum entries hold better"
-    elif skew_ratio <= 0.85: skew = "vol cooling short-term → mean-reversion entries work better"
-    else: skew = "vol profile balanced"
-    if breadth_pct >= 60 and mom_breadth >= 55 and bias == "up": action = "prefer LONGs on pullbacks"
-    elif breadth_pct <= 40 and mom_breadth <= 45 and bias == "down": action = "prefer SHORTs on bounces"
-    else: action = "trade both sides; keep size moderate"
-    return f"Market level: {level}; bias: {bias}; {skew}; {action}"
+    if skew_ratio >= 1.15:
+        skew_note = "short-term vol expanding → momentum bias"
+    elif skew_ratio <= 0.85:
+        skew_note = "short-term vol cooling → mean-reversion bias"
+    else:
+        skew_note = "vol horizons aligned"
+
+    # ADX × Breadth
+    _, _, adx_idx = _note_adx(adx_avg)
+    _, _, br_idx  = _note_pct(breadth, "breadth")
+    if adx_idx >= 3 and br_idx <= 1:
+        trend_breadth = "strong trend but narrow participation (fragile leadership)"
+    elif adx_idx >= 3 and br_idx >= 3:
+        trend_breadth = "strong trend with broad participation (healthier)"
+    elif adx_idx <= 1 and br_idx >= 3:
+        trend_breadth = "broad participation but weak trend (likely choppy ups)"
+    else:
+        trend_breadth = "trend strength and participation balanced"
+
+    # Breadth × Momentum breadth
+    _, _, mom_idx = _note_pct(mom_breadth, "mom")
+    if br_idx >= 3 and mom_idx <= 1:
+        mom_cross = "breadth good but momentum weak → pullback risk / rotation"
+    elif br_idx <= 1 and mom_idx >= 3:
+        mom_cross = "momentum pockets exist despite narrow breadth → selective longs"
+    else:
+        mom_cross = "breadth and momentum breadth consistent"
+
+    return f"{skew_note}; {trend_breadth}; {mom_cross}"
+
+def _universe_guide(avg20, avg60, breadth, ups, downs, mom_breadth, adx_avg):
+    # headline bias
+    bias = "up" if ups > downs else ("down" if downs > ups else "mixed")
+    # use RV buckets to name the level
+    lab20, _, i20 = _note_rv(avg20)
+    lab60, _, i60 = _note_rv(avg60)
+    level = max(i20, i60)  # take the 'noisier' of the two as level
+    level_str = ["very low","low","moderate","elevated","high"][level]
+    cross = _cross_effects_text(avg20, avg60, breadth, mom_breadth, adx_avg)
+    # action hint
+    if bias == "up" and breadth >= 60 and mom_breadth >= 55:
+        action = "prefer LONGs on pullbacks"
+    elif bias == "down" and breadth <= 40 and mom_breadth <= 45:
+        action = "prefer SHORTs on bounces"
+    else:
+        action = "trade both sides; keep size moderate"
+    return f"Market level: {level_str}; bias: {bias}; {cross}; {action}"
+
 
 @st.cache_data(ttl=240, show_spinner=False)
 def universe_snapshot_tf(symbols: list[str], tf: str, max_symbols: int = 12):
@@ -714,17 +822,32 @@ with tab_universe:
         snap = universe_snapshot_tf(SYMBOLS, tf=comp_tf, max_symbols=topn)
         if snap:
             now_utc = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+        
+            # Build per-row notes via 5-buckets
+            rv20_lab, rv20_txt, _ = _note_rv(snap['avg20'])
+            rv60_lab, rv60_txt, _ = _note_rv(snap['avg60'])
+            br_lab,  br_txt,  _   = _note_pct(snap['breadth'], "breadth")
+            mb_lab,  mb_txt,  _   = _note_pct(snap['mom_breadth'], "mom")
+            adx_lab, adx_txt, _   = _note_adx(snap['adx_avg'])
+            rsi_lab, rsi_txt, _   = _note_rsi(snap['rsi_avg'])
+        
+            cross_text = _cross_effects_text(snap['avg20'], snap['avg60'], snap['breadth'],
+                                             snap['mom_breadth'], snap['adx_avg'])
+            guide = _universe_guide(snap['avg20'], snap['avg60'], snap['breadth'],
+                                    snap['ups'], snap['downs'], snap['mom_breadth'], snap['adx_avg'])
+        
             rows = [
-                ("Avg RV20", f"{snap['avg20']:.1f}%", _level_note_rv(snap['avg20'])),
-                ("Avg RV60", f"{snap['avg60']:.1f}%", _level_note_rv(snap['avg60'])),
+                ("Avg RV20", f"{snap['avg20']:.1f}%", f"{rv20_lab} — {rv20_txt}"),
+                ("Avg RV60", f"{snap['avg60']:.1f}%", f"{rv60_lab} — {rv60_txt}"),
                 ("Median RV20", f"{snap['med20']:.1f}%", ""),
                 ("Median RV60", f"{snap['med60']:.1f}%", ""),
-                (f"Breadth (above {comp_tf} EMA200)", f"{snap['breadth']:.0f}%", "higher = broader uptrend"),
-                ("Momentum breadth (MACD>signal)", f"{snap['mom_breadth']:.0f}%", "higher = more coins with bullish momentum"),
+                (f"Breadth (above {comp_tf} EMA200)", f"{snap['breadth']:.0f}%", f"{br_lab} — {br_txt}"),
+                ("Momentum breadth (MACD>signal)", f"{snap['mom_breadth']:.0f}%", f"{mb_lab} — {mb_txt}"),
                 ("Regime votes", f"↑ {snap['ups']} / ↓ {snap['downs']} / ↔ {snap['sides']}", "bias from up vs down counts"),
-                ("Avg ADX14 (trend strength)", f"{snap['adx_avg']:.1f}", _note_adx(snap['adx_avg'])),
-                ("Avg RSI14", f"{snap['rsi_avg']:.1f}", _note_rsi(snap['rsi_avg'])),
-                ("Universe guide", "", snap['guide'])
+                ("Avg ADX14 (trend strength)", f"{snap['adx_avg']:.1f}", f"{adx_lab} — {adx_txt}"),
+                ("Avg RSI14", f"{snap['rsi_avg']:.1f}", f"{rsi_lab} — {rsi_txt}"),
+                ("Cross-effects", "", cross_text),                # <-- new line
+                ("Universe guide", "", guide)
             ]
             table_parts = [f"""
 <div class="scroll-wrap">
