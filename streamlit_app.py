@@ -1,12 +1,11 @@
-# streamlit_app.py — v1.13.0
-# QA-driven update (vs 1.12.2)
-# - Auto-refresh: toggleable (off by default) via st.autorefresh → без «стрибу» сторінки.
-# - «Легкий режим» графіка: лінія замість свічок, вимикає план-лінії поза 1h, мінус лаги на мобілці.
-# - «Новини & фондинг» тепер реально показуються (раніше були не використані).
-# - Прокрутка: усі «довгі» блоки у власних скрол-контейнерах (без зсуву всієї сторінки).
-# - «report.json (debug)» сховано за чекбоксом (менше візуального шуму).
-# - Краще UX-підписування, підсвітка, ноти, кнопка «Copy plan» (копіювання рівнів).
-# - Додатковий захист від порожніх/зламаних провайдерів та дрібні стійкі фікси.
+# streamlit_app.py — v1.13.1
+# Changes vs 1.13.0 (user-driven):
+# - Lightweight chart OFF by default (can still be toggled on).
+# - Plan A/B added for 4h (with own bias & levels).
+# - "Playbook" blocks: condensed, human-meaningful use-case of signals
+#   (what to do now, when invalidated, if/then) on both tabs.
+# - Chart draws plan lines on 1h and on 4h (when respective TF selected).
+# - Minor text/UX tweaks; no breaking changes.
 
 import os, json, math, time, re, requests, pandas as pd, numpy as np
 import streamlit as st
@@ -50,7 +49,7 @@ COIN_NAME = {
 
 st.set_page_config(page_title="Top-N — Regime, Signals & Futures Context", layout="wide")
 
-# ========= CSS / small UI hygiene =========
+# ========= CSS =========
 st.markdown("""
 <style>
 .block-container{padding-top:1.1rem; padding-bottom:2rem;}
@@ -60,15 +59,13 @@ st.markdown("""
 @media (max-width: 640px){
   .tile-table td, .tile-table th { padding: 6px 6px !important; font-size: 13px !important; }
 }
-.code-like {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-  background: #f5f7fa; border: 1px solid #e5e7eb; padding: 6px 8px; border-radius: 8px;
-}
 .small-note{ color:#6b7280; font-size:12px; }
+.badge{display:inline-block; padding:2px 8px; border-radius:9999px; font-size:12px; margin-right:6px; background:#eef2ff;}
+.code-like{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; background:#f5f7fa; border:1px solid #e5e7eb; padding:6px 8px; border-radius:8px;}
 </style>
 """, unsafe_allow_html=True)
 
-# ========= UTILITIES =========
+# ========= UTIL =========
 def _base_from_symbol(symbol: str) -> str:
     s = symbol.upper()
     if s.endswith("USDT") or s.endswith("USDC"): return s[:-4]
@@ -92,7 +89,7 @@ def http_json(url: str, params=None, timeout=7, allow_worker=False):
     for label, full, p in attempts:
         try:
             r = requests.get(full, params=None if label=="WORKER" else p, timeout=timeout,
-                             headers={"Accept":"application/json","User-Agent":"binfapp/1.13.0"})
+                             headers={"Accept":"application/json","User-Agent":"binfapp/1.13.1"})
             if r.status_code != 200: last_e = f"status {r.status_code}"; continue
             ct = (r.headers.get("content-type") or "").lower()
             if "application/json" not in ct and not ("/klines" in full or "/candles" in full):
@@ -103,7 +100,7 @@ def http_json(url: str, params=None, timeout=7, allow_worker=False):
     raise RuntimeError(f"http_json failed: {last_e}")
 
 def http_text(url: str, timeout=7):
-    r = requests.get(url, timeout=timeout, headers={"User-Agent":"binfapp/1.13.0"}); r.raise_for_status()
+    r = requests.get(url, timeout=timeout, headers={"User-Agent":"binfapp/1.13.1"}); r.raise_for_status()
     return r.text
 
 # ========= DYNAMIC UNIVERSE =========
@@ -115,7 +112,7 @@ def _coingecko_topn_with_caps(per_page=100, page=1):
         j = requests.get(
             "https://api.coingecko.com/api/v3/coins/markets",
             params={"vs_currency":"usd","order":"market_cap_desc","per_page":per_page,"page":page},
-            timeout=7, headers={"Accept":"application/json","User-Agent":"binfapp/1.13.0"}
+            timeout=7, headers={"Accept":"application/json","User-Agent":"binfapp/1.13.1"}
         ).json()
         out = []
         for it in j:
@@ -157,7 +154,6 @@ def _binance_futures_universe_from_bases(candidates: list[str], _seed=None):
 # ========= SIDEBAR =========
 st.sidebar.header("Data & Options")
 
-# Universe, worker & report
 topn = st.sidebar.number_input("Universe size (Top-N by market cap)", min_value=5, max_value=30,
                                value=TOPN_DEFAULT, step=1,
                                help="Coins from CoinGecko top caps, filtered to Binance USDT perps.")
@@ -189,11 +185,10 @@ report_url = st.sidebar.text_input("GitHub Pages report.json (debug URL)", value
 
 # Performance toggles
 col_perf1, col_perf2 = st.sidebar.columns(2)
-auto_refresh_on = col_perf1.checkbox("Auto-refresh", value=False, help="Refresh every 12 min without scroll jump.")
-light_mode_chart = col_perf2.checkbox("Lightweight chart", value=True, help="Use line instead of candles (faster).")
+auto_refresh_on = col_perf1.checkbox("Auto-refresh", value=False, help="Refresh every ~12 min.")
+light_mode_chart = col_perf2.checkbox("Lightweight chart", value=False, help="Line chart (faster); OFF by default.")
 
 if auto_refresh_on:
-    # ~12 min, без перезавантаження всієї сторінки користувачем
     st.autorefresh(interval=12*60*1000, key="auto_refresh_12m")
 
 # ========= DATA HELPERS =========
@@ -340,10 +335,6 @@ def per_tf_recommendation(sig):
     if (not up) and (sig["ema20_cross_50"]=="bear") and (sig["macd_cross"]=="bear") and adx_ok: return "Sell rips"
     return "Range trade"
 
-def kpretty(x):
-    try: return f"{x:,.2f}"
-    except Exception: return str(x)
-
 def rv_one_liner(rv20: float, rv60: float) -> str:
     ratio = (rv20 / max(rv60, 1e-9))
     if ratio >= 1.15:  skew = "short-term vol rising vs medium-term (momentum bias; wider stops)."
@@ -444,7 +435,6 @@ def universe_daily_spec(symbols: list[str], bases_for_symbols: list[str], scheme
     return {"symbols": symbols, "bases": bases_for_symbols, "weights": weights.tolist(), "scheme": scheme, "day": day_key}
 
 def _today_key(): return datetime.utcnow().strftime("%Y-%m-%d")
-def _symbols_and_bases_for_universe(symbols: list[str]): return symbols, [_base_from_symbol(s) for s in symbols]
 
 @st.cache_data(ttl=300, show_spinner=False)
 def composite_series(symbols: list[str], weights: list[float], interval: str, method: str = "arith"):
@@ -489,6 +479,7 @@ def _symbol_vitals_tf(s: str, tf: str):
     except Exception:
         return {"ok": False}
 
+# ====== Buckets & Notes (unchanged) ======
 def _bucket(value: float, edges: list[float], labels: list[str]):
     if value is None or not np.isfinite(value): return "n/a", 2
     idx = 0
@@ -589,67 +580,91 @@ def _cross_effects_text(avg20, avg60, breadth, mom_breadth, adx_avg):
 
 def _universe_guide(avg20, avg60, breadth, ups, downs, mom_breadth, adx_avg):
     bias = "up" if ups > downs else ("down" if downs > ups else "mixed")
-    lab20, _, i20 = _note_rv(avg20)
-    lab60, _, i60 = _note_rv(avg60)
+    _, _, i20 = _note_rv(avg20); _, _, i60 = _note_rv(avg60)
     level = max(i20, i60)
     level_str = ["very low","low","moderate","elevated","high"][level]
     cross = _cross_effects_text(avg20, avg60, breadth, mom_breadth, adx_avg)
     if bias == "up" and breadth >= 60 and mom_breadth >= 55:
-        action = "prefer LONGs on pullbacks"
+        action = "Prefer LONGs on pullbacks"
     elif bias == "down" and breadth <= 40 and mom_breadth <= 45:
-        action = "prefer SHORTs on bounces"
+        action = "Prefer SHORTs on bounces"
     else:
-        action = "trade both sides; keep size moderate"
-    return f"Market level: {level_str}; bias: {bias}; {cross}; {action}"
-
-@st.cache_data(ttl=240, show_spinner=False)
-def universe_snapshot_tf(symbols: list[str], tf: str, max_symbols: int = 12):
-    syms = symbols[:max_symbols]; rows = []
-    for s in syms:
-        v = _symbol_vitals_tf(s, tf)
-        if v.get("ok"): rows.append((s, v))
-    if not rows: return None
-    rv20s = [v["rv20"] for _, v in rows]; rv60s = [v["rv60"] for _, v in rows]
-    labels = [v["label"] for _, v in rows]
-    above = sum(v["above200"] for _, v in rows); mom_bull = sum(v["macd_bull"] for _, v in rows)
-    adx_vals = [v["adx14"] for _, v in rows]; rsi_vals = [v["rsi14"] for _, v in rows]
-    avg20 = float(np.mean(rv20s)); avg60 = float(np.mean(rv60s))
-    med20 = float(np.median(rv20s)); med60 = float(np.median(rv60s))
-    ups = sum(1 for x in labels if x == "Trend ↑"); downs = sum(1 for x in labels if x == "Trend ↓"); sides = len(labels)-ups-downs
-    breadth = 100.0 * above / max(1, len(rows)); mom_breadth = 100.0 * mom_bull / max(1, len(rows))
-    adx_avg = float(np.mean(adx_vals)); rsi_avg = float(np.mean(rsi_vals))
-    guide = _universe_guide(avg20, avg60, breadth, ups, downs, mom_breadth, adx_avg)
-    return {"n": len(rows), "avg20": avg20, "avg60": avg60, "med20": med20, "med60": med60,
-            "ups": ups, "downs": downs, "sides": sides, "breadth": breadth, "mom_breadth": mom_breadth,
-            "adx_avg": adx_avg, "rsi_avg": rsi_avg, "guide": guide}
+        action = "Trade both sides; keep size moderate"
+    return f"{action} · Mode: {level_str} · {cross}"
 
 # ========= APP LAYOUT =========
 tab_token, tab_universe = st.tabs(["Token", "Universe Index"])
 
+# ===== Helpers for Plan on multiple TFs =====
+def _atr_like(df, n=14):
+    h, l, c = df["high"], df["low"], df["close"]
+    tr = pd.concat([(h - l),(h - c.shift()).abs(),(l - c.shift()).abs()], axis=1).max(axis=1)
+    return tr.rolling(n).mean()
+
+def _favor_long_from_signal(sig_tf: dict, sig_higher: dict | None = None) -> bool:
+    # Generic bias: within-TF alignment; if higher TF strongly opposite → flip to conservative False.
+    up = (sig_tf["price_vs_ema200"] == "above")
+    align = (sig_tf["ema20_cross_50"] == "bull")
+    mom = (sig_tf["macd_cross"] == "bull")
+    base_yes = (up and (align or mom))
+    if not sig_higher:
+        return base_yes
+    # If higher TF is strong opposite (below EMA200 & MACD bear & ADX strong), veto longs.
+    strong_down_higher = (
+        (sig_higher["price_vs_ema200"] == "below")
+        and (sig_higher["macd_cross"] == "bear")
+        and (sig_higher.get("adx14", 0) >= 28)
+    )
+    if base_yes and strong_down_higher:
+        return False
+    return base_yes
+
+def plan_levels(df: pd.DataFrame, favor_long: bool):
+    s = df["close"]
+    ema20v, ema50v, ema200v = float(ema(s,20).iloc[-1]), float(ema(s,50).iloc[-1]), float(ema(s,200).iloc[-1])
+    swing_hi = float(df["high"].tail(40).max()); swing_lo = float(df["low"].tail(40).min())
+    atr = float(_atr_like(df, 14).iloc[-1] or 0)
+    entry = (ema20v + ema50v) / 2.0; buf = max(0.0015 * entry, 0.35 * atr)
+    if favor_long and s.iloc[-1] < ema200v: favor_long = False
+    if favor_long:
+        stop = min(swing_lo, entry) - buf; risk = max(1e-9, entry - stop)
+        t1 = entry + risk; t2 = max(entry + 2*risk, swing_hi)
+        note = "Plan A (long): buy dip to EMA20/EMA50; SL under swing-low+buffer; T1=1R, T2=2R/prev high."
+        alt  = "Plan B: if loses EMA200 and fails to reclaim, flip to shorts on weak bounce."
+        side = "LONG"
+    else:
+        stop = max(swing_hi, entry) + buf; risk = max(1e-9, stop - entry)
+        t1 = entry - risk; t2 = min(entry - 2*risk, swing_lo)
+        note = "Plan A (short): sell bounce to EMA20/EMA50; SL above swing-high+buffer; T1=1R, T2=2R/prev low."
+        alt  = "Plan B: if reclaims EMA200 and holds, prefer longs on pullbacks."
+        side = "SHORT"
+    return {"entry":entry, "stop":stop, "t1":t1, "t2":t2, "note":note, "alt":alt, "side": side}
+
 # ================= TOKEN TAB =================
 with tab_token:
-    # Вибір TF керує графіком; план — завжди з 1h
     vitals_tf = st.selectbox("Vitals / Chart TF", options=TFS, index=TFS.index("1h"))
 
     # DFs
-    df_vtf, src_vtf = tf_data[vitals_tf]
     df_1h,  src_1h  = tf_data["1h"]
+    df_4h,  src_4h  = tf_data["4h"]
+    df_vtf, src_vtf = tf_data[vitals_tf]
 
     # Header captions (TF-aware)
     st.caption(f"Prices source: **{src_vtf}** · Worker: {'ON' if cf_worker else 'OFF'}")
     s_vtf = df_vtf.set_index("ts")["close"]
     rv20_vtf = realized_vol_series(s_vtf, 20).iloc[-1] * 100
     rv60_vtf = realized_vol_series(s_vtf, 60).iloc[-1] * 100
-    st.caption(f"Using last CLOSED bar for **{vitals_tf}** (no repaint).")
-    st.caption(rv_one_liner(rv20_vtf, rv60_vtf))
+    st.caption(f"Using last CLOSED bar for **{vitals_tf}** (no repaint). • {rv_one_liner(rv20_vtf, rv60_vtf)}")
 
-    # Signals for all frames (for matrix + narrative)
+    # Signals all frames
     signals = {tf: trend_flags(tf_data[tf][0]) for tf in TFS}
+    s1h, s4h, s1d = signals["1h"], signals["4h"], signals["1d"]
 
+    # Aggregate regime
     def aggregate_regime(signals: dict):
         ups = downs = sides = 0; strong = 0
-        for tf, s in signals.items():
-            sc, conf, lab = regime_score(s)
+        for _, s in signals.items():
+            _, conf, lab = regime_score(s)
             if conf in ("medium","high"): strong += 1
             if lab == "Trend ↑": ups += 1
             elif lab == "Trend ↓": downs += 1
@@ -659,65 +674,72 @@ with tab_token:
         return {"label": label, "conf": conf, "ups": ups, "downs": downs, "sides": sides}
     agg = aggregate_regime(signals)
 
-    st.subheader("Token Vitals")
+    # ===== PLAYBOOK (condensed, human) =====
+    favor_long_1h = _favor_long_from_signal(s1h, s4h)
+    favor_long_4h = _favor_long_from_signal(s4h, s1d)
+
+    plan_1h = plan_levels(df_1h.copy(), favor_long_1h)
+    plan_4h = plan_levels(df_4h.copy(), favor_long_4h)
+
+    st.subheader("Playbook")
+    cA, cB = st.columns([1,1])
+    with cA:
+        st.markdown(f"**1h bias:** `{plan_1h['side']}`  \n"
+                    f"**Plan A:** Entry `{plan_1h['entry']:.2f}` • SL `{plan_1h['stop']:.2f}` • T1 `{plan_1h['t1']:.2f}` • T2 `{plan_1h['t2']:.2f}`  \n"
+                    f"<span class='small-note'>Alt: {plan_1h['alt']}</span>", unsafe_allow_html=True)
+    with cB:
+        st.markdown(f"**4h bias:** `{plan_4h['side']}`  \n"
+                    f"**Plan A:** Entry `{plan_4h['entry']:.2f}` • SL `{plan_4h['stop']:.2f}` • T1 `{plan_4h['t1']:.2f}` • T2 `{plan_4h['t2']:.2f}`  \n"
+                    f"<span class='small-note'>Alt: {plan_4h['alt']}</span>", unsafe_allow_html=True)
+
     st.markdown(
-        f"Aggregate Regime: **{agg['label']}** (confidence: *{agg['conf']}*)  "
-        f"<span class='small-note'>TF votes — ↑:{agg['ups']} / ↓:{agg['downs']} / ↔:{agg['sides']}</span>",
-        unsafe_allow_html=True,
+        f"<span class='badge'>Now: <b>{agg['label']}</b> / conf {agg['conf']}</span>"
+        f"<span class='small-note'>  TF votes — ↑:{agg['ups']} / ↓:{agg['downs']} / ↔:{agg['sides']}</span>",
+        unsafe_allow_html=True
     )
-    s1h, s4h, sd = signals["1h"], signals["4h"], signals["1d"]
-    lines = [
-        "Tone: " + ("buyers have the ball; most frames lean up." if agg["label"]=="Trend ↑"
-                    else "sellers in control; bounces meet supply." if agg["label"]=="Trend ↓"
-                    else "balanced — chop until a clean break sticks."),
-        "Daily vs EMA200: " + ("above (long bias)" if sd["price_vs_ema200"]=="above" else "below (short bias)"),
-        "4h alignment: " + ("EMA20>EMA50 (trend aligned)" if s4h["ema20_cross_50"]=="bull" else "EMA20<EMA50 (not aligned)"),
-        "1h momentum: " + ("MACD>signal (up)" if s1h["macd_cross"]=="bull" else "MACD<signal (down)")
-    ]
-    for ln in lines: st.markdown(f"- {ln}")
 
-    # ---- PLAN (always computed on 1h) ----
-    def _atr_like(df, n=14):
-        h, l, c = df["high"], df["low"], df["close"]
-        tr = pd.concat([(h - l),(h - c.shift()).abs(),(l - c.shift()).abs()], axis=1).max(axis=1)
-        return tr.rolling(n).mean()
-    def _plan_bias_1h(signals: dict, df_1h: pd.DataFrame) -> bool:
-        s1, s4 = signals["1h"], signals["4h"]
-        one_hour_up = (s1["price_vs_ema200"] == "above") and ((s1["ema20_cross_50"] == "bull") or (s1["macd_cross"] == "bull"))
-        strong_4h_down = ((s4["price_vs_ema200"] == "below") and (s4["macd_cross"] == "bear") and (s4.get("adx14", 0) >= 28))
-        if one_hour_up and not strong_4h_down: return True
-        if not one_hour_up: return False
-        return True
-    def plan_levels(df_1h: pd.DataFrame, favor_long: bool):
-        s = df_1h["close"]
-        ema20v, ema50v, ema200v = float(ema(s,20).iloc[-1]), float(ema(s,50).iloc[-1]), float(ema(s,200).iloc[-1])
-        swing_hi = float(df_1h["high"].tail(40).max()); swing_lo = float(df_1h["low"].tail(40).min())
-        atr = float(_atr_like(df_1h, 14).iloc[-1] or 0)
-        entry = (ema20v + ema50v) / 2.0; buf = max(0.0015 * entry, 0.35 * atr)
-        if favor_long and s.iloc[-1] < ema200v: favor_long = False
-        if favor_long:
-            stop = min(swing_lo, entry) - buf; risk = max(1e-9, entry - stop)
-            t1 = entry + risk; t2 = max(entry + 2*risk, swing_hi)
-            note = "Plan A (long): buy dip toward EMA20/EMA50; stop under swing-low + buffer; T1=1R, T2=2R/prev high."
-            alt  = "Plan B: if 1h loses EMA200 and fails to reclaim, flip to shorts on a weak bounce."
+    # Quick invalidation hints (plain english)
+    invos = []
+    if plan_1h["side"]=="LONG": invos.append("1h closes under EMA200 and fails to reclaim → stand down on longs.")
+    else: invos.append("1h reclaims and holds above EMA200 → avoid chasing shorts.")
+    if plan_4h["side"]=="LONG": invos.append("4h trend breaks (EMA20<EMA50) + MACD bear on 4h → scale down long exposure.")
+    else: invos.append("4h regains alignment (EMA20>EMA50) + MACD bull → reduce short bias.")
+    st.markdown("- " + "\n- ".join(invos))
+
+    # ===== Chart =====
+    with st.expander(f"Chart ({vitals_tf})", expanded=True):
+        df = df_vtf.copy()
+        x_ts = df["ts"]; close_s = df["close"]
+        if not PLOTLY or light_mode_chart:
+            st.line_chart(close_s.set_axis(x_ts), use_container_width=True, height=420)
+            st.caption("Line chart (fast). Turn OFF 'Lightweight chart' for candlesticks.")
         else:
-            stop = max(swing_hi, entry) + buf; risk = max(1e-9, stop - entry)
-            t1 = entry - risk; t2 = min(entry - 2*risk, swing_lo)
-            note = "Plan A (short): sell bounce into EMA20/EMA50; stop above swing-high + buffer; T1=1R, T2=2R/prev low."
-            alt  = "Plan B: if 1h reclaims EMA200 and holds, prefer longs on pullbacks."
-        return {"entry":entry, "stop":stop, "t1":t1, "t2":t2, "note":note, "alt":alt}
+            ema20s, ema50s, ema200s = ema(close_s,20), ema(close_s,50), ema(close_s,200)
+            fig = go.Figure()
+            fig.add_trace(go.Candlestick(x=x_ts, open=df["open"], high=df["high"], low=df["low"], close=df["close"],
+                                         name="OHLC", opacity=0.9))
+            fig.add_trace(go.Scatter(x=x_ts, y=ema20s,  name="EMA20",  line=dict(width=1.4)))
+            fig.add_trace(go.Scatter(x=x_ts, y=ema50s,  name="EMA50",  line=dict(width=1.4)))
+            fig.add_trace(go.Scatter(x=x_ts, y=ema200s, name="EMA200", line=dict(width=1.4)))
 
-    favor_long = _plan_bias_1h(signals, df_1h)
-    plan = plan_levels(df_1h.copy(), favor_long)
-    st.markdown(f"**{plan['note']}**  \n*Alternative:* {plan['alt']}")
+            # Plan lines on 1h & 4h depending on selected TF
+            if vitals_tf == "1h":
+                P = plan_1h
+                for y, name, dash in [(P["entry"],"Entry","dot"),(P["stop"],"Stop","dash"),
+                                      (P["t1"],"T1","dash"),(P["t2"],"T2","dash")]:
+                    fig.add_hline(y=y, line_dash=dash, annotation_text=f"{name}: {y:,.2f}", annotation_position="right")
+            elif vitals_tf == "4h":
+                P = plan_4h
+                for y, name, dash in [(P["entry"],"Entry","dot"),(P["stop"],"Stop","dash"),
+                                      (P["t1"],"T1","dash"),(P["t2"],"T2","dash")]:
+                    fig.add_hline(y=y, line_dash=dash, annotation_text=f"{name}: {y:,.2f}", annotation_position="right")
+            else:
+                st.caption("Plan lines drawn on **1h** and **4h** (select respective TF).")
 
-    # Кнопка копіювання плану
-    plan_text = (f"{symbol} · 1h plan — "
-                 f"Entry {plan['entry']:.2f}, Stop {plan['stop']:.2f}, T1 {plan['t1']:.2f}, T2 {plan['t2']:.2f}. "
-                 f"{'LONG' if favor_long else 'SHORT'} bias.")
-    st.text_input("Copy plan (readonly)", value=plan_text, label_visibility="collapsed", disabled=True)
+            fig.update_layout(height=520, margin=dict(l=10,r=10,t=30,b=10), xaxis_rangeslider_visible=False)
+            st.plotly_chart(fig, use_container_width=True)
 
-    # ========= SIGNAL MATRIX =========
+    # ===== Signal matrix (kept, but purpose-line added) =====
     def tf_row(tframe):
         df2, _ = tf_data[tframe]
         s2 = signals[tframe]
@@ -732,6 +754,9 @@ with tab_token:
                 "adx": s2["adx14"], "rv20%": rv20,
                 "score": score, "conf": conf2, "label": lab2, "recommend": rec}
     mat = pd.DataFrame([tf_row(t) for t in TFS]).set_index("tf")
+
+    # One-liner purpose (why look here)
+    st.caption("Purpose: quick **bias check per TF** and a **simple action hint** (Buy dips / Sell rips / Range trade).")
 
     def color_yesno(val, yes="✓", no="×"):
         if val == yes: return "background-color:#d1ffd6"
@@ -758,7 +783,6 @@ with tab_token:
         if val=="Sell rips": return "background-color:#ffd1d1"
         return "background-color:#fff2cc"
 
-    st.subheader("Signal matrix (multi-TF)")
     styled = (
         mat.style
           .applymap(color_updown, subset=["ema200_dir"])
@@ -770,35 +794,9 @@ with tab_token:
     )
     st.dataframe(styled, use_container_width=True, height=260)
 
-    # ========= CHART =========
-    with st.expander(f"Chart ({vitals_tf})", expanded=True):
-        df = df_vtf.copy()
-        x_ts = df["ts"]; close_s = df["close"]
-        ema20s, ema50s, ema200s = ema(close_s,20), ema(close_s,50), ema(close_s,200)
-        if not PLOTLY or light_mode_chart:
-            # Легкий режим — лінія, без свічок і без горизонтальних ліній (крім 1h через підпис)
-            st.line_chart(close_s.set_axis(x_ts), use_container_width=True, height=420)
-            st.caption("Lightweight: line chart. Enable candlesticks by turning OFF 'Lightweight chart' in the sidebar.")
-        else:
-            fig = go.Figure()
-            fig.add_trace(go.Candlestick(x=x_ts, open=df["open"], high=df["high"], low=df["low"], close=df["close"],
-                                         name="OHLC", opacity=0.85))
-            fig.add_trace(go.Scatter(x=x_ts, y=ema20s,  name="EMA20",  line=dict(width=1.4)))
-            fig.add_trace(go.Scatter(x=x_ts, y=ema50s,  name="EMA50",  line=dict(width=1.4)))
-            fig.add_trace(go.Scatter(x=x_ts, y=ema200s, name="EMA200", line=dict(width=1.4)))
-            if vitals_tf == "1h":
-                for y, name, dash in [(plan["entry"],"Entry","dot"),(plan["stop"],"Stop","dash"),
-                                      (plan["t1"],"T1","dash"),(plan["t2"],"T2","dash")]:
-                    fig.add_hline(y=y, line_dash=dash, annotation_text=f"{name}: {y:,.2f}", annotation_position="right")
-            else:
-                st.caption("Plan lines shown only on 1h.")
-            fig.update_layout(height=520, margin=dict(l=10,r=10,t=30,b=10), xaxis_rangeslider_visible=False)
-            st.plotly_chart(fig, use_container_width=True)
-
-    # ========= NEWS & FUNDING (scroll-contained) =========
+    # ===== Funding & News (unchanged UI) =====
     st.subheader("Funding & News")
     c1, c2 = st.columns([1,2])
-
     with c1:
         df_f, src_f = fetch_funding(symbol, limit=48)
         if df_f is not None and not df_f.empty:
@@ -809,7 +807,6 @@ with tab_token:
             st.caption(f"Source: {src_f}")
         else:
             st.info("Funding history unavailable from providers.")
-
     with c2:
         term = _news_term(symbol)
         items = fetch_news(NEWS_FEEDS, lookback_hours=NEWS_LOOKBACK_HOURS, max_items=8, term=term)
@@ -844,8 +841,49 @@ with tab_universe:
         c_ema20, c_ema50, c_ema200 = ema(scomp,20), ema(scomp,50), ema(scomp,200)
         c_rv20 = float(realized_vol_series(scomp,20).iloc[-1] * 100)
         c_rv60 = float(realized_vol_series(scomp,60).iloc[-1] * 100)
+
+        # ===== Universe Playbook (condensed) =====
+        snap = None
+        try:
+            from statistics import mean
+        except Exception:
+            pass
+        from math import isnan
+
+        # Snapshot for guidance
+        from numpy import mean as npmean
+        # reuse function
+        @st.cache_data(ttl=240, show_spinner=False)
+        def _universe_snapshot_tf_local(symbols: list[str], tf: str, max_symbols: int = 12):
+            syms = symbols[:max_symbols]; rows = []
+            for s in syms:
+                v = _symbol_vitals_tf(s, tf)
+                if v.get("ok"): rows.append((s, v))
+            if not rows: return None
+            rv20s = [v["rv20"] for _, v in rows]; rv60s = [v["rv60"] for _, v in rows]
+            labels = [v["label"] for _, v in rows]
+            above = sum(v["above200"] for _, v in rows); mom_bull = sum(v["macd_bull"] for _, v in rows)
+            adx_vals = [v["adx14"] for _, v in rows]; rsi_vals = [v["rsi14"] for _, v in rows]
+            avg20 = float(np.mean(rv20s)); avg60 = float(np.mean(rv60s))
+            ups = sum(1 for x in labels if x == "Trend ↑"); downs = sum(1 for x in labels if x == "Trend ↓"); sides = len(labels)-ups-downs
+            breadth = 100.0 * above / max(1, len(rows)); mom_breadth = 100.0 * mom_bull / max(1, len(rows))
+            adx_avg = float(np.mean(adx_vals)); rsi_avg = float(np.mean(rsi_vals))
+            guide = _universe_guide(avg20, avg60, breadth, ups, downs, mom_breadth, adx_avg)
+            return {"n": len(rows), "avg20": avg20, "avg60": avg60,
+                    "ups": ups, "downs": downs, "sides": sides, "breadth": breadth,
+                    "mom_breadth": mom_breadth, "adx_avg": adx_avg, "rsi_avg": rsi_avg, "guide": guide}
+
+        snap = _universe_snapshot_tf_local(SYMBOLS, tf=comp_tf, max_symbols=topn)
+        if snap:
+            st.markdown(
+                f"**Playbook:** {snap['guide']}  \n"
+                f"<span class='small-note'>Breadth: {snap['breadth']:.0f}% · Momentum breadth: {snap['mom_breadth']:.0f}% · ADX(avg): {snap['adx_avg']:.1f}</span>",
+                unsafe_allow_html=True
+            )
+
         st.caption(rv_one_liner(c_rv20, c_rv60))
 
+        # Chart
         if PLOTLY and not light_mode_chart:
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=comp_df["ts"], y=comp_df["composite"], name="Composite", line=dict(width=2)))
@@ -857,62 +895,31 @@ with tab_universe:
         else:
             st.line_chart(comp_df.set_index("ts")["composite"], height=320, use_container_width=True)
 
-        # TF-aware Top-N snapshot (scroll-contained)
-        snap = universe_snapshot_tf(SYMBOLS, tf=comp_tf, max_symbols=topn)
+        # Purpose line
+        st.caption("Purpose: universe = **market weather** for Top-N basket. Use it to size risk, choose trend vs mean-reversion, and pick sides.")
+
+        # Details table (kept)
         if snap:
             now_utc = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
-
-            rv20_lab, rv20_txt, _ = _note_rv(snap['avg20'])
-            rv60_lab, rv60_txt, _ = _note_rv(snap['avg60'])
-            br_lab,  br_txt,  _   = _note_pct(snap['breadth'], "breadth")
-            mb_lab,  mb_txt,  _   = _note_pct(snap['mom_breadth'], "mom")
-            adx_lab, adx_txt, _   = _note_adx(snap['adx_avg'])
-            rsi_lab, rsi_txt, _   = _note_rsi(snap['rsi_avg'])
-            cross_text = _cross_effects_text(snap['avg20'], snap['avg60'], snap['breadth'],
-                                             snap['mom_breadth'], snap['adx_avg'])
-            guide = snap["guide"]
-
             rows = [
-                ("Avg RV20", f"{snap['avg20']:.1f}%", f"{rv20_lab} — {rv20_txt}"),
-                ("Avg RV60", f"{snap['avg60']:.1f}%", f"{rv60_lab} — {rv60_txt}"),
-                ("Median RV20", f"{snap['med20']:.1f}%", ""),
-                ("Median RV60", f"{snap['med60']:.1f}%", ""),
-                (f"Breadth (above {comp_tf} EMA200)", f"{snap['breadth']:.0f}%", f"{br_lab} — {br_txt}"),
-                ("Momentum breadth (MACD>signal)", f"{snap['mom_breadth']:.0f}%", f"{mb_lab} — {mb_txt}"),
                 ("Regime votes", f"↑ {snap['ups']} / ↓ {snap['downs']} / ↔ {snap['sides']}", "bias from up vs down counts"),
-                ("Avg ADX14 (trend strength)", f"{snap['adx_avg']:.1f}", f"{adx_lab} — {adx_txt}"),
-                ("Avg RSI14", f"{snap['rsi_avg']:.1f}", f"{rsi_lab} — {rsi_txt}"),
-                ("Cross-effects", "", cross_text),
-                ("Universe guide", "", guide)
+                ("Breadth (above EMA200)", f"{snap['breadth']:.0f}%", "participation across basket"),
+                ("Momentum breadth (MACD>signal)", f"{snap['mom_breadth']:.0f}%", "how many with bullish momentum"),
+                ("Avg ADX14", f"{snap['adx_avg']:.1f}", "trend strength"),
+                ("Avg RSI14", f"{snap['rsi_avg']:.1f}", "overbought/oversold tilt"),
+                ("Avg RV20 / RV60", f"{snap['avg20']:.1f}% / {snap['avg60']:.1f}%", "volatility level & skew"),
             ]
-            table_parts = [f"""
+            html = ["""
 <div class="scroll-wrap">
   <table class="tile-table" style="width:100%; border-collapse:collapse;">
-    <thead>
-      <tr>
-        <th style="text-align:left;">Parameter</th>
-        <th style="text-align:left;">Value</th>
-        <th style="text-align:left;">Note / dynamics</th>
-      </tr>
-    </thead>
+    <thead><tr><th style="text-align:left;">Metric</th><th style="text-align:left;">Value</th><th style="text-align:left;">Note</th></tr></thead>
     <tbody>
 """]
             for p, v, n in rows:
-                table_parts.append(
-                    f"""<tr>
-<td style="border-top:1px solid #e5e7eb;">{p}</td>
-<td style="border-top:1px solid #e5e7eb;">{v}</td>
-<td style="border-top:1px solid #e5e7eb;">{n}</td>
-</tr>"""
-                )
-            table_parts.append(f"""</tbody></table>
-  <div class="small-note" style="margin-top:6px;">{now_utc}</div>
-</div>""")
-            st.markdown("\n".join(table_parts), unsafe_allow_html=True)
-        else:
-            st.info("Top-N snapshot not available (providers busy).")
+                html.append(f"<tr><td style='border-top:1px solid #e5e7eb;'>{p}</td><td style='border-top:1px solid #e5e7eb;'>{v}</td><td style='border-top:1px solid #e5e7eb;'>{n}</td></tr>")
+            html.append(f"</tbody></table><div class='small-note' style='margin-top:6px;'>{now_utc}</div></div>")
+            st.markdown("\n".join(html), unsafe_allow_html=True)
 
-        st.caption("Notes: Basket & weights reconstitute once per UTC day (frozen for the session). Composite uses close-only normalization; choose Arithmetic or Geometric method.")
     except Exception as e:
         st.error(f"Composite build failed: {e}")
 
@@ -926,7 +933,6 @@ def fetch_report(url: str, _seed=None):
     return payload
 
 with st.expander("report.json — raw & pivot (debug)", expanded=False):
-    # сховали у «expander», щоб не грузити UI
     payload = None
     try:
         payload = fetch_report(report_url, _seed=None)
