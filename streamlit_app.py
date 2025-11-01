@@ -1,9 +1,9 @@
-# streamlit_app.py — v1.13.2
-# Changes vs 1.13.1:
-# - Навігація: видимий перемикач "Main / Universe" + URL ?tab=token|universe.
-# - Playbook: додано блок для 1D (з урахуванням 1W як старшого ТФ).
-# - Планові лінії тепер відображаються і на 1D.
-# - Структура без st.tabs (стабільні URL для кожної «вкладки»).
+# streamlit_app.py — v1.13.3
+# Fix: remove stray '}' in _okx_klines() that caused SyntaxError.
+# Also from v1.13.2:
+# - Visible "Main / Universe" switch with URL ?tab=token|universe
+# - 1D Playbook block + plan lines on 1D
+# - Lightweight chart OFF by default (toggle in sidebar)
 
 import os, json, math, time, re, requests, pandas as pd, numpy as np
 import streamlit as st
@@ -85,7 +85,7 @@ def http_json(url: str, params=None, timeout=7, allow_worker=False):
     for label, full, p in attempts:
         try:
             r = requests.get(full, params=None if label=="WORKER" else p, timeout=timeout,
-                             headers={"Accept":"application/json","User-Agent":"binfapp/1.13.2"})
+                             headers={"Accept":"application/json","User-Agent":"binfapp/1.13.3"})
             if r.status_code != 200: last_e = f"status {r.status_code}"; continue
             ct = (r.headers.get("content-type") or "").lower()
             if "application/json" not in ct and not ("/klines" in full or "/candles" in full):
@@ -96,7 +96,7 @@ def http_json(url: str, params=None, timeout=7, allow_worker=False):
     raise RuntimeError(f"http_json failed: {last_e}")
 
 def http_text(url: str, timeout=7):
-    r = requests.get(url, timeout=timeout, headers={"User-Agent":"binfapp/1.13.2"}); r.raise_for_status()
+    r = requests.get(url, timeout=timeout, headers={"User-Agent":"binfapp/1.13.3"}); r.raise_for_status()
     return r.text
 
 # ========= UNIVERSE =========
@@ -108,7 +108,7 @@ def _coingecko_topn_with_caps(per_page=100, page=1):
         j = requests.get(
             "https://api.coingecko.com/api/v3/coins/markets",
             params={"vs_currency":"usd","order":"market_cap_desc","per_page":per_page,"page":page},
-            timeout=7, headers={"Accept":"application/json","User-Agent":"binfapp/1.13.2"}
+            timeout=7, headers={"Accept":"application/json","User-Agent":"binfapp/1.13.3"}
         ).json()
         out = []
         for it in j:
@@ -215,8 +215,6 @@ def _binance_spot_klines(symbol: str, interval: str, limit: int, worker_url: str
         return _to_df_binance(data), f"binance({base})"
 
 def _okx_klines(symbol: str, interval: str, limit: int):
-    base = _base_from_symbol(symbol); inst = f"{base}-USDT"}
-    # fix typo just in case
     inst = f"{_base_from_symbol(symbol)}-USDT"
     bar_map = {"15m":"15m","1h":"1H","4h":"4H","1d":"1D","1w":"1W"}
     bar = bar_map.get(interval, "1H")
@@ -632,7 +630,7 @@ if tab_choice == "Main":
             fig.update_layout(height=520, margin=dict(l=10,r=10,t=30,b=10), xaxis_rangeslider_visible=False)
             st.plotly_chart(fig, use_container_width=True)
 
-    # ===== Signal matrix (як було) =====
+    # ===== Signal matrix =====
     def tf_row(tframe):
         df2, _ = tf_data[tframe]
         s2 = signals[tframe]
@@ -735,7 +733,6 @@ else:
         c_rv20 = float(realized_vol_series(scomp,20).iloc[-1] * 100)
         c_rv60 = float(realized_vol_series(scomp,60).iloc[-1] * 100)
 
-        # Snapshot / Playbook
         @st.cache_data(ttl=240, show_spinner=False)
         def _universe_snapshot_tf_local(symbols: list[str], tf: str, max_symbols: int = 12):
             syms = symbols[:max_symbols]; rows = []
