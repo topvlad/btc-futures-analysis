@@ -1,9 +1,13 @@
-# streamlit_app.py — v1.13.3
-# Fix: remove stray '}' in _okx_klines() that caused SyntaxError.
-# Also from v1.13.2:
+# streamlit_app.py — v1.13.4
+# Changes vs 1.13.3:
+# - Restored Universe helpers (_bucket/_note_rv/_note_adx/_note_pct/_cross_effects_text/_universe_guide)
+# - No other logic changes.
+#
+# From 1.13.x:
 # - Visible "Main / Universe" switch with URL ?tab=token|universe
 # - 1D Playbook block + plan lines on 1D
 # - Lightweight chart OFF by default (toggle in sidebar)
+# - Fix stray '}' in _okx_klines()
 
 import os, json, math, time, re, requests, pandas as pd, numpy as np
 import streamlit as st
@@ -85,7 +89,7 @@ def http_json(url: str, params=None, timeout=7, allow_worker=False):
     for label, full, p in attempts:
         try:
             r = requests.get(full, params=None if label=="WORKER" else p, timeout=timeout,
-                             headers={"Accept":"application/json","User-Agent":"binfapp/1.13.3"})
+                             headers={"Accept":"application/json","User-Agent":"binfapp/1.13.4"})
             if r.status_code != 200: last_e = f"status {r.status_code}"; continue
             ct = (r.headers.get("content-type") or "").lower()
             if "application/json" not in ct and not ("/klines" in full or "/candles" in full):
@@ -96,10 +100,10 @@ def http_json(url: str, params=None, timeout=7, allow_worker=False):
     raise RuntimeError(f"http_json failed: {last_e}")
 
 def http_text(url: str, timeout=7):
-    r = requests.get(url, timeout=timeout, headers={"User-Agent":"binfapp/1.13.3"}); r.raise_for_status()
+    r = requests.get(url, timeout=timeout, headers={"User-Agent":"binfapp/1.13.4"}); r.raise_for_status()
     return r.text
 
-# ========= UNIVERSE =========
+# ========= UNIVERSE (sources) =========
 TOPN_DEFAULT = 10
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -108,7 +112,7 @@ def _coingecko_topn_with_caps(per_page=100, page=1):
         j = requests.get(
             "https://api.coingecko.com/api/v3/coins/markets",
             params={"vs_currency":"usd","order":"market_cap_desc","per_page":per_page,"page":page},
-            timeout=7, headers={"Accept":"application/json","User-Agent":"binfapp/1.13.3"}
+            timeout=7, headers={"Accept":"application/json","User-Agent":"binfapp/1.13.4"}
         ).json()
         out = []
         for it in j:
@@ -338,6 +342,86 @@ def rv_one_liner(rv20: float, rv60: float) -> str:
     level = "very high" if hi>=100 else ("high" if hi>=70 else ("moderate" if hi>=40 else "calm"))
     return f"Volatility is {level}; {skew}"
 
+# ===== Helpers for Universe snapshot / guide (restored) =====
+def _bucket(value: float, edges: list[float], labels: list[str]):
+    """5-бакетний класифікатор: edges [e1,e2,e3,e4] -> label idx 0..4"""
+    if value is None or not np.isfinite(value): return "n/a", 2
+    for i, e in enumerate(edges):
+        if value < e:
+            return labels[i], i
+    return labels[-1], 4
+
+def _note_rv(value: float):
+    labels = ["low","med-low","average","med-high","high"]            # <30 <45 <60 <85 >=85
+    lab, idx = _bucket(value, [30, 45, 60, 85], labels)
+    txt = {0:"very calm; breakouts fade", 1:"calm; mean-reversion favoured",
+           2:"balanced", 3:"elevated; momentum holds", 4:"high; size down / wider stops"}[idx]
+    return lab, txt, idx
+
+def _note_adx(value: float):
+    labels = ["low","med-low","average","med-high","high"]            # <17 <22 <28 <38 >=38
+    lab, idx = _bucket(value, [17, 22, 28, 38], labels)
+    txt = {0:"very weak trend", 1:"weak trend", 2:"trend building",
+           3:"strong trend", 4:"very strong trend"}[idx]
+    return lab, txt, idx
+
+def _note_pct(value: float, kind: str):
+    """Для breadth / momentum breadth."""
+    labels = ["low","med-low","average","med-high","high"]            # <30 <45 <55 <70 >=70
+    lab, idx = _bucket(value, [30, 45, 55, 70], labels)
+    if kind == "breadth":
+        extra = {0:"narrow advance",1:"modestly narrow",2:"balanced",
+                 3:"broadening",4:"very broad"}[idx]
+    else:
+        extra = {0:"few with momentum",1:"limited momentum",2:"mixed",
+                 3:"solid momentum",4:"widespread momentum"}[idx]
+    return lab, extra, idx
+
+def _cross_effects_text(avg20, avg60, breadth, mom_breadth, adx_avg):
+    # RV skew
+    skew_ratio = avg20 / max(avg60, 1e-9)
+    if skew_ratio >= 1.15: skew_note = "short-term vol expanding → momentum bias"
+    elif skew_ratio <= 0.85: skew_note = "short-term vol cooling → mean-reversion bias"
+    else: skew_note = "vol horizons aligned"
+
+    # ADX × Breadth
+    _, _, adx_idx = _note_adx(adx_avg)
+    _, _, br_idx  = _note_pct(breadth, "breadth")
+    if adx_idx >= 3 and br_idx <= 1:
+        trend_breadth = "strong trend but narrow participation"
+    elif adx_idx >= 3 and br_idx >= 3:
+        trend_breadth = "strong trend with broad participation"
+    elif adx_idx <= 1 and br_idx >= 3:
+        trend_breadth = "broad participation but weak trend"
+    else:
+        trend_breadth = "trend strength and participation balanced"
+
+    # Breadth × Momentum breadth
+    _, _, mom_idx = _note_pct(mom_breadth, "mom")
+    if br_idx >= 3 and mom_idx <= 1:
+        mom_cross = "breadth good but momentum weak → pullback risk / rotation"
+    elif br_idx <= 1 and mom_idx >= 3:
+        mom_cross = "momentum pockets despite narrow breadth → selective longs"
+    else:
+        mom_cross = "breadth & momentum breadth consistent"
+
+    return f"{skew_note}; {trend_breadth}; {mom_cross}"
+
+def _universe_guide(avg20, avg60, breadth, ups, downs, mom_breadth, adx_avg):
+    bias = "up" if ups > downs else ("down" if downs > ups else "mixed")
+    _, _, i20 = _note_rv(avg20); _, _, i60 = _note_rv(avg60)
+    level = max(i20, i60)
+    level_str = ["very low","low","moderate","elevated","high"][level]
+    cross = _cross_effects_text(avg20, avg60, breadth, mom_breadth, adx_avg)
+
+    if bias == "up" and breadth >= 60 and mom_breadth >= 55:
+        action = "prefer LONGs on pullbacks"
+    elif bias == "down" and breadth <= 40 and mom_breadth <= 45:
+        action = "prefer SHORTs on bounces"
+    else:
+        action = "trade both sides; keep size moderate"
+    return f"Market level: {level_str}; bias: {bias}; {cross}; {action}"
+
 # ========= CORE LOAD =========
 @st.cache_data(ttl=120, show_spinner=False)
 def get_all_tf_data(symbol: str, tfs: list[str], _seed=None):
@@ -413,7 +497,7 @@ def fetch_news(feeds: list[str], lookback_hours: int = 24, max_items: int = 8, t
         seen.add(it["link"]); dedup.append(it)
     return dedup[:max_items]
 
-# ========= UNIVERSE HELPERS =========
+# ========= UNIVERSE HELPERS (weights & composite) =========
 def _weights_from_cg(bases: list[str], scheme: str):
     by_base = {it["base"]: it for it in cg}
     rows = [by_base.get(b, {"market_cap":1.0,"total_volume":1.0}) for b in bases]
