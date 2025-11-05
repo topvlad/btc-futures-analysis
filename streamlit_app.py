@@ -1,8 +1,11 @@
-# streamlit_app.py — v1.13.5-hotfix1
-# Hotfix:
-# - Replace segmented_control(selection=...) → segmented_control(default=...)
-# Other:
-# - Human-readable Playbook; sliding triplet; 1M timeframe; Main/Universe; Universe Index.
+# streamlit_app.py — v1.13.6 (old-layout)
+# What’s new vs 1.13.4 (layout preserved):
+# - Human-readable Playbook (state → Plan A/B → cancel)
+# - Sliding Playbook triplet bound to selected TF
+# - 1M timeframe support (Binance/OKX)
+# - Universe helpers restored; Index weighting kept
+# - Lightweight chart OFF by default
+# - OLD LAYOUT BACK: visible Streamlit tabs ["Main","Universe"] (no segmented_control)
 
 import os, json, math, time, re, requests, pandas as pd, numpy as np
 import streamlit as st
@@ -23,7 +26,7 @@ TFS = ["15m", "1h", "4h", "1d", "1w"]
 TF_SECONDS = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800}
 TF_LIMITS  = {"15m": 1200, "1h": 900, "4h": 700, "1d": 420, "1w": 240}
 
-# --- add monthly timeframe (1M) ---
+# monthly TF
 if "1M" not in TFS:
     TFS.append("1M")
 TF_SECONDS.update({"1M": 30*86400})
@@ -91,7 +94,7 @@ def http_json(url: str, params=None, timeout=7, allow_worker=False):
     for label, full, p in attempts:
         try:
             r = requests.get(full, params=None if label=="WORKER" else p, timeout=timeout,
-                             headers={"Accept":"application/json","User-Agent":"binfapp/1.13.5-hotfix1"})
+                             headers={"Accept":"application/json","User-Agent":"binfapp/1.13.6"})
             if r.status_code != 200: last_e = f"status {r.status_code}"; continue
             ct = (r.headers.get("content-type") or "").lower()
             if "application/json" not in ct and not ("/klines" in full or "/candles" in full):
@@ -102,7 +105,7 @@ def http_json(url: str, params=None, timeout=7, allow_worker=False):
     raise RuntimeError(f"http_json failed: {last_e}")
 
 def http_text(url: str, timeout=7):
-    r = requests.get(url, timeout=timeout, headers={"User-Agent":"binfapp/1.13.5-hotfix1"}); r.raise_for_status()
+    r = requests.get(url, timeout=timeout, headers={"User-Agent":"binfapp/1.13.6"}); r.raise_for_status()
     return r.text
 
 # ========= UNIVERSE (sources) =========
@@ -114,7 +117,7 @@ def _coingecko_topn_with_caps(per_page=100, page=1):
         j = requests.get(
             "https://api.coingecko.com/api/v3/coins/markets",
             params={"vs_currency":"usd","order":"market_cap_desc","per_page":per_page,"page":page},
-            timeout=7, headers={"Accept":"application/json","User-Agent":"binfapp/1.13.5-hotfix1"}
+            timeout=7, headers={"Accept":"application/json","User-Agent":"binfapp/1.13.6"}
         ).json()
         out = []
         for it in j:
@@ -569,6 +572,7 @@ def render_universe_tab(tf_for_index: str):
         else:
             st.line_chart(series.set_index("ts")["universe"])
 
+    # quick breadth snapshot on selected TF
     snap_tf = tf_for_index
     ups=downs=0; adxes=[]; mom_bulls=0; total=0
     rv20s=[]; rv60s=[]
@@ -598,43 +602,13 @@ def render_universe_tab(tf_for_index: str):
         st.markdown(f"**Snapshot ({snap_tf.upper()}):** {guide['headline']}")
         st.caption(guide["cross"])
 
-# ========= Main / Universe switch (with URL query support) =========
-def get_query_params():
-    try:
-        return dict(st.query_params)
-    except Exception:
-        return st.experimental_get_query_params()
-
-def set_query_param(**kwargs):
-    try:
-        st.query_params.update(kwargs)
-    except Exception:
-        st.experimental_set_query_params(**kwargs)
-
-q = get_query_params()
-tab_param = (q.get("tab") if isinstance(q.get("tab"), str) else (q.get("tab",[None])[0])) if q else None
-tab_default = "token" if tab_param not in ("token","universe") else tab_param
-
-if hasattr(st, "segmented_control"):
-    toggle = st.segmented_control(
-        "View",
-        options=["Main","Universe"],
-        default=("Main" if tab_default=="token" else "Universe"),
-        help="Switch view. Also via ?tab=token|universe"
-    )
-else:
-    toggle = st.radio("View", options=["Main","Universe"],
-                      index=0 if tab_default=="token" else 1, horizontal=True)
-
-current_tab = "token" if (toggle=="Main") else "universe"
-if current_tab != tab_default:
-    set_query_param(tab=current_tab)
-
-# ========= Timeframe selector =========
+# ========= UI (OLD LAYOUT WITH TABS) =========
+st.title("Top-N — Regime, Signals & Futures Context")
 tf_selected = st.selectbox("Timeframe", options=TFS, index=TFS.index("1h") if "1h" in TFS else 0)
 
-# ========= MAIN TAB =========
-if current_tab == "token":
+tab_main, tab_universe = st.tabs(["Main", "Universe"])
+
+with tab_main:
     st.header(f"{symbol} — {tf_selected.upper()}")
     try:
         df_raw, src = get_klines_df(symbol, tf_selected, TF_LIMITS.get(tf_selected, 500))
@@ -644,17 +618,18 @@ if current_tab == "token":
         st.stop()
     render_chart(df.rename(columns={"open":"open","high":"high","low":"low","close":"close"}), tf_selected, light_mode_chart)
     st.caption(f"Source: {src}. Bars: {len(df)}")
+
     if tf_selected == "1d":
         with st.expander("1D Playbook — сигнали та планові рівні (EMA)"):
             s = df["close"]
             st.write(f"EMA20: {ema(s,20).iloc[-1]:.2f} • EMA50: {ema(s,50).iloc[-1]:.2f} • EMA200: {ema(s,200).iloc[-1]:.2f}")
             st.caption("Планові рівні — ковзні середні як динамічні підтримки/опори.")
+
     render_playbook_triplet(symbol, tf_selected)
 
-# ========= UNIVERSE TAB =========
-else:
+with tab_universe:
     st.header("Universe")
-    tf_universe = st.selectbox("Universe Index timeframe", options=TFS, index=TFS.index("4h") if "4h" in TFS else 0)
+    tf_universe = st.selectbox("Universe Index timeframe", options=TFS, index=TFS.index("4h") if "4h" in TFS else 0, key="tf_universe")
     render_universe_tab(tf_universe)
     with st.expander("Universe constituents"):
         st.write(", ".join([_base_from_symbol(s) for s in SYMBOLS[:topn]]))
