@@ -1,12 +1,8 @@
-# streamlit_app.py — v1.13.5
-# Changes vs 1.13.4:
-# - Human-readable Playbook (state → Plan A/B → cancel condition)
-# - Sliding Playbook triplet (e.g., 1h→[1h,4h,1d], 4h→[4h,1d,1w], 1d→[1d,1w,1M])
-# - Added 1M timeframe support (Binance/OKX)
-# - Visible Main/Universe switch + URL ?tab=token|universe
-# - Universe Index with selectable weighting (cap/liquidity/equal)
-# - Kept lightweight chart OFF by default
-# - Restored Universe helpers
+# streamlit_app.py — v1.13.5-hotfix1
+# Hotfix:
+# - Replace segmented_control(selection=...) → segmented_control(default=...)
+# Other:
+# - Human-readable Playbook; sliding triplet; 1M timeframe; Main/Universe; Universe Index.
 
 import os, json, math, time, re, requests, pandas as pd, numpy as np
 import streamlit as st
@@ -95,7 +91,7 @@ def http_json(url: str, params=None, timeout=7, allow_worker=False):
     for label, full, p in attempts:
         try:
             r = requests.get(full, params=None if label=="WORKER" else p, timeout=timeout,
-                             headers={"Accept":"application/json","User-Agent":"binfapp/1.13.5"})
+                             headers={"Accept":"application/json","User-Agent":"binfapp/1.13.5-hotfix1"})
             if r.status_code != 200: last_e = f"status {r.status_code}"; continue
             ct = (r.headers.get("content-type") or "").lower()
             if "application/json" not in ct and not ("/klines" in full or "/candles" in full):
@@ -106,7 +102,7 @@ def http_json(url: str, params=None, timeout=7, allow_worker=False):
     raise RuntimeError(f"http_json failed: {last_e}")
 
 def http_text(url: str, timeout=7):
-    r = requests.get(url, timeout=timeout, headers={"User-Agent":"binfapp/1.13.5"}); r.raise_for_status()
+    r = requests.get(url, timeout=timeout, headers={"User-Agent":"binfapp/1.13.5-hotfix1"}); r.raise_for_status()
     return r.text
 
 # ========= UNIVERSE (sources) =========
@@ -118,7 +114,7 @@ def _coingecko_topn_with_caps(per_page=100, page=1):
         j = requests.get(
             "https://api.coingecko.com/api/v3/coins/markets",
             params={"vs_currency":"usd","order":"market_cap_desc","per_page":per_page,"page":page},
-            timeout=7, headers={"Accept":"application/json","User-Agent":"binfapp/1.13.5"}
+            timeout=7, headers={"Accept":"application/json","User-Agent":"binfapp/1.13.5-hotfix1"}
         ).json()
         out = []
         for it in j:
@@ -348,9 +344,8 @@ def rv_one_liner(rv20: float, rv60: float) -> str:
     level = "very high" if hi>=100 else ("high" if hi>=70 else ("moderate" if hi>=40 else "calm"))
     return f"Volatility is {level}; {skew}"
 
-# ===== Helpers for Universe snapshot / guide (restored & completed) =====
+# ===== Helpers for Universe snapshot / guide =====
 def _bucket(value: float, edges: list[float], labels: list[str]):
-    """5-бакетний класифікатор: edges [e1,e2,e3,e4] -> label idx 0..4"""
     if value is None or not np.isfinite(value): return "n/a", 2
     for i, e in enumerate(edges):
         if value < e:
@@ -358,22 +353,21 @@ def _bucket(value: float, edges: list[float], labels: list[str]):
     return labels[-1], 4
 
 def _note_rv(value: float):
-    labels = ["low","med-low","average","med-high","high"]            # <30 <45 <60 <85 >=85
+    labels = ["low","med-low","average","med-high","high"]
     lab, idx = _bucket(value, [30, 45, 60, 85], labels)
     txt = {0:"very calm; breakouts fade", 1:"calm; mean-reversion favoured",
            2:"balanced", 3:"elevated; momentum holds", 4:"high; size down / wider stops"}[idx]
     return lab, txt, idx
 
 def _note_adx(value: float):
-    labels = ["low","med-low","average","med-high","high"]            # <17 <22 <28 <38 >=38
+    labels = ["low","med-low","average","med-high","high"]
     lab, idx = _bucket(value, [17, 22, 28, 38], labels)
     txt = {0:"very weak trend", 1:"weak trend", 2:"trend building",
            3:"strong trend", 4:"very strong trend"}[idx]
     return lab, txt, idx
 
 def _note_pct(value: float, kind: str):
-    """Для breadth / momentum breadth."""
-    labels = ["low","med-low","average","med-high","high"]            # <30 <45 <55 <70 >=70
+    labels = ["low","med-low","average","med-high","high"]
     lab, idx = _bucket(value, [30, 45, 55, 70], labels)
     if kind == "breadth":
         extra = {0:"narrow advance",1:"modestly narrow",2:"balanced",
@@ -384,13 +378,10 @@ def _note_pct(value: float, kind: str):
     return lab, extra, idx
 
 def _cross_effects_text(avg20, avg60, breadth, mom_breadth, adx_avg):
-    # RV skew
     skew_ratio = avg20 / max(avg60, 1e-9)
     if skew_ratio >= 1.15: skew_note = "short-term vol expanding → momentum bias"
     elif skew_ratio <= 0.85: skew_note = "short-term vol cooling → mean-reversion bias"
     else: skew_note = "vol horizons aligned"
-
-    # ADX × Breadth
     _, _, adx_idx = _note_adx(adx_avg)
     _, _, br_idx  = _note_pct(breadth, "breadth")
     if adx_idx >= 3 and br_idx <= 1:
@@ -401,8 +392,6 @@ def _cross_effects_text(avg20, avg60, breadth, mom_breadth, adx_avg):
         trend_breadth = "broad participation but weak trend"
     else:
         trend_breadth = "trend strength and participation balanced"
-
-    # Breadth × Momentum breadth
     _, _, mom_idx = _note_pct(mom_breadth, "mom")
     if br_idx >= 3 and mom_idx <= 1:
         mom_cross = "breadth good but momentum weak → pullback risk / rotation"
@@ -410,11 +399,9 @@ def _cross_effects_text(avg20, avg60, breadth, mom_breadth, adx_avg):
         mom_cross = "momentum pockets despite narrow breadth → selective longs"
     else:
         mom_cross = "breadth & momentum breadth consistent"
-
     return f"{skew_note}; {trend_breadth}; {mom_cross}"
 
 def _universe_guide(avg20, avg60, breadth, ups, downs, mom_breadth, adx_avg):
-    """Повертає коротку нотатку-орієнтир по ринку."""
     bias = "up" if ups > downs else ("down" if downs > ups else "flat")
     rv_lab20, _, _ = _note_rv(avg20)
     rv_lab60, _, _ = _note_rv(avg60)
@@ -422,27 +409,16 @@ def _universe_guide(avg20, avg60, breadth, ups, downs, mom_breadth, adx_avg):
     br_lab, _, _   = _note_pct(breadth, "breadth")
     mom_lab, _, _  = _note_pct(mom_breadth, "mom")
     cross = _cross_effects_text(avg20, avg60, breadth, mom_breadth, adx_avg)
-
     head = f"Market bias: {bias.upper()} • RV(20/60): {rv_lab20}/{rv_lab60} • ADX: {adx_lab} • Breadth: {br_lab} • Momentum breadth: {mom_lab}"
     return {"headline": head, "cross": cross}
 
 # ========= Human Playbook =========
 def human_playbook_from_sig(sig: dict) -> dict:
-    """
-    Повертає короткий людський план дій для ТФ на основі trend_flags().
-    Структура:
-      - state: короткий підсумок стану
-      - plan_a: базова дія (якщо тренд підтверджений)
-      - plan_b: альтернативна дія (якщо сигнал слабшає або йдемо проти)
-      - risk: на що дивитися як на «відбій/скасування»
-    """
     up = (sig["price_vs_ema200"] == "above")
     ema_ok = (sig["ema20_cross_50"] == "bull")
     macd_ok = (sig["macd_cross"] == "bull")
     adx_val = sig.get("adx14", 0.0)
     adx_ok = adx_val >= 22
-
-    # Оцінка стану
     if up and ema_ok and macd_ok and adx_ok:
         state = "Тренд вгору підтверджений"
         plan_a = "Шукати покупки на відкатах до EMA20/EMA50"
@@ -463,42 +439,33 @@ def human_playbook_from_sig(sig: dict) -> dict:
         else:
             plan_a = "Легкий пріоритет продажів, чекати підтвердження MACD/EMA"
             plan_b = "Нейтрально: працювати від рівнів із короткими стопами"
-
-    # Ризик/скасування сценарію
     if up:
         risk = "Скасування лонг-плану, якщо ціна закріпиться нижче EMA50 і MACD піде нижче сигналу"
     else:
         risk = "Скасування шорт-плану, якщо ціна закріпиться вище EMA50 і MACD піде вище сигналу"
-
     return {
-        "state": state,
-        "plan_a": plan_a,
-        "plan_b": plan_b,
-        "risk": risk,
+        "state": state, "plan_a": plan_a, "plan_b": plan_b, "risk": risk,
         "adx": adx_val,
         "ema20": sig["ema20"], "ema50": sig["ema50"], "ema200": sig["ema200"],
         "rsi14": sig["rsi14"], "macd": sig["macd"], "macd_signal": sig["macd_signal"]
     }
 
 def tf_triplet(selected_tf: str) -> list[str]:
-    """Повертає 3 суміжні ТФ під обраний. Для 1d додаємо 1M як третій."""
     mapping = {
         "15m": ["15m","1h","4h"],
         "1h":  ["1h","4h","1d"],
         "4h":  ["4h","1d","1w"],
         "1d":  ["1d","1w","1M"],
-        "1w":  ["1w","1M","1M"],  # дубль 1M як заповнювач
+        "1w":  ["1w","1M","1M"],
         "1M":  ["1M","1M","1M"]
     }
     return mapping.get(selected_tf, ["1h","4h","1d"])
 
 def compute_signals_for_tfs(symbol: str, tfs: list[str]) -> dict:
-    """Тягне свічки, обрізає незакриту, рахує trend_flags для кожного ТФ."""
     out = {}
     for tf in tfs:
         try:
             df, _src = get_klines_df(symbol, tf, TF_LIMITS.get(tf, 500))
-            df = df.rename(columns={"open":"open","high":"high","low":"low","close":"close"})
             df = drop_unclosed(df, tf)
             if len(df) < 210:
                 out[tf] = None
@@ -512,7 +479,6 @@ def compute_signals_for_tfs(symbol: str, tfs: list[str]) -> dict:
 def render_playbook_triplet(symbol: str, tf_selected: str):
     tfs = tf_triplet(tf_selected)
     sigs = compute_signals_for_tfs(symbol, tfs)
-
     st.subheader("Playbook (ковзне вікно з 3 ТФ)")
     cols = st.columns(len(tfs))
     for i, tf in enumerate(tfs):
@@ -603,7 +569,6 @@ def render_universe_tab(tf_for_index: str):
         else:
             st.line_chart(series.set_index("ts")["universe"])
 
-    # Snapshot/guide over SYMBOLS breadth on 4h (default) or selected tf
     snap_tf = tf_for_index
     ups=downs=0; adxes=[]; mom_bulls=0; total=0
     rv20s=[]; rv60s=[]
@@ -618,7 +583,6 @@ def render_universe_tab(tf_for_index: str):
             else: downs+=1
             if sig["macd_cross"]=="bull": mom_bulls+=1
             adxes.append(sig["adx14"])
-            # RV estimates
             sclose = df["close"]
             rv20s.append(float(realized_vol_series(sclose,20).iloc[-1]*100))
             rv60s.append(float(realized_vol_series(sclose,60).iloc[-1]*100))
@@ -651,41 +615,40 @@ q = get_query_params()
 tab_param = (q.get("tab") if isinstance(q.get("tab"), str) else (q.get("tab",[None])[0])) if q else None
 tab_default = "token" if tab_param not in ("token","universe") else tab_param
 
-toggle = st.segmented_control("View", options=["Main","Universe"],
-                              selection="Main" if tab_default=="token" else "Universe",
-                              help="Switch view. Also via ?tab=token|universe") if hasattr(st, "segmented_control") else \
-         st.radio("View", options=["Main","Universe"], index=0 if tab_default=="token" else 1, horizontal=True)
+if hasattr(st, "segmented_control"):
+    toggle = st.segmented_control(
+        "View",
+        options=["Main","Universe"],
+        default=("Main" if tab_default=="token" else "Universe"),
+        help="Switch view. Also via ?tab=token|universe"
+    )
+else:
+    toggle = st.radio("View", options=["Main","Universe"],
+                      index=0 if tab_default=="token" else 1, horizontal=True)
+
 current_tab = "token" if (toggle=="Main") else "universe"
 if current_tab != tab_default:
     set_query_param(tab=current_tab)
 
-# ========= Timeframe selector for chart/drivers =========
+# ========= Timeframe selector =========
 tf_selected = st.selectbox("Timeframe", options=TFS, index=TFS.index("1h") if "1h" in TFS else 0)
 
 # ========= MAIN TAB =========
 if current_tab == "token":
     st.header(f"{symbol} — {tf_selected.upper()}")
-
-    # Data
     try:
         df_raw, src = get_klines_df(symbol, tf_selected, TF_LIMITS.get(tf_selected, 500))
         df = drop_unclosed(df_raw, tf_selected)
     except Exception as e:
         st.error(f"Failed to load klines: {e}")
         st.stop()
-
-    # Chart
     render_chart(df.rename(columns={"open":"open","high":"high","low":"low","close":"close"}), tf_selected, light_mode_chart)
     st.caption(f"Source: {src}. Bars: {len(df)}")
-
-    # 1D-specific plan lines block (simple visual cue via EMAs)
     if tf_selected == "1d":
         with st.expander("1D Playbook — сигнали та планові рівні (EMA)"):
             s = df["close"]
             st.write(f"EMA20: {ema(s,20).iloc[-1]:.2f} • EMA50: {ema(s,50).iloc[-1]:.2f} • EMA200: {ema(s,200).iloc[-1]:.2f}")
             st.caption("Планові рівні — ковзні середні як динамічні підтримки/опори.")
-
-    # Sliding Playbook (3 TFs)
     render_playbook_triplet(symbol, tf_selected)
 
 # ========= UNIVERSE TAB =========
@@ -693,7 +656,6 @@ else:
     st.header("Universe")
     tf_universe = st.selectbox("Universe Index timeframe", options=TFS, index=TFS.index("4h") if "4h" in TFS else 0)
     render_universe_tab(tf_universe)
-
     with st.expander("Universe constituents"):
         st.write(", ".join([_base_from_symbol(s) for s in SYMBOLS[:topn]]))
 
